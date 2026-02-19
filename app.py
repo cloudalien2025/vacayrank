@@ -9,7 +9,7 @@
 # - No write operations. No BD API calls in this milestone.
 # - Caching:
 #   1) Streamlit in-memory cache (st.cache_data)
-#   2) Local disk cache under ./.vacayrank_cache/
+#   2) Local disk cache under ./vacayrank_cache/
 #
 # Suggested requirements.txt:
 #   streamlit
@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 # -----------------------------
 
 APP_TITLE = "VacayRank v1 — Milestone 1 (Read-Only Inventory Engine)"
-CACHE_DIR = ".vacayrank_cache"
+CACHE_DIR = "vacayrank_cache"
 DEFAULT_TIMEOUT_SECS = 20
 
 XML_NS = {
@@ -706,7 +706,7 @@ def main() -> None:
         st.write("Disk cache locations for this sitemap index URL:")
         st.code(json_path)
         st.code(csv_path)
-        st.caption("Tip: Commit **nothing** from .vacayrank_cache to GitHub (add to .gitignore).")
+        st.caption("Tip: Commit **nothing** from vacayrank_cache to GitHub (add to .gitignore).")
 
     # Lightweight recommendation block (non-placeholder, actionable)
     st.subheader("Next Step (Milestone 2 preview)")
