@@ -350,24 +350,36 @@ def parse_urlset(xml_text: str, source_sitemap_url: str) -> List[UrlRow]:
     except ET.ParseError as e:
         raise FetchError(f"Invalid XML in child sitemap: {e}") from e
 
-    tag = _strip_ns(root.tag).lower()
-    if not tag.endswith("urlset"):
+    root_localname = _strip_ns(root.tag).lower()
+    if root_localname != "urlset":
         # Some sites nest indexes; if so, parse as index and return rows empty here.
         return []
 
     rows: List[UrlRow] = []
-    for url_el in root.findall("sm:url", XML_NS) + root.findall("url"):
-        loc_el = url_el.find("sm:loc", XML_NS) or url_el.find("loc")
-        if loc_el is None or not loc_el.text:
+    for el in root.iter():
+        if _strip_ns(el.tag).lower() != "url":
             continue
-        loc = loc_el.text.strip()
 
-        lastmod_el = url_el.find("sm:lastmod", XML_NS) or url_el.find("lastmod")
-        lastmod = lastmod_el.text.strip() if (lastmod_el is not None and lastmod_el.text) else None
+        loc: Optional[str] = None
+        lastmod: Optional[str] = None
+        for child in el:
+            child_localname = _strip_ns(child.tag).lower()
+            if child_localname == "loc" and child.text and not loc:
+                loc = child.text.strip()
+            elif child_localname == "lastmod" and child.text and not lastmod:
+                lastmod = child.text.strip()
+
+        if not loc:
+            continue
 
         rows.append(UrlRow(url=loc, url_type="unclassified", source_sitemap=source_sitemap_url, lastmod=lastmod))
 
     return rows
+
+
+def _xml_root_localname(xml_text: str) -> str:
+    root = ET.fromstring(xml_text.strip())
+    return _strip_ns(root.tag).lower()
 
 
 def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
@@ -563,13 +575,35 @@ def _fetch_inventory_uncached(
                     child_failures[nested_url] = str(e)
                     _append_debug(active_debug_log, f"Nested child sitemap failed: {nested_url} -> {e}")
                     continue
+                nested_root = _xml_root_localname(nested_xml)
                 nested_rows = parse_urlset(nested_xml, source_sitemap_url=nested_url)
+                _append_debug(
+                    active_debug_log,
+                    f"Child sitemap parsed: url={nested_url}, root={nested_root}, urls_extracted={len(nested_rows)}",
+                )
+                if nested_root == "urlset" and not nested_rows:
+                    snippet = nested_xml.strip().replace("\n", " ")[:200]
+                    _append_debug(
+                        active_debug_log,
+                        f"WARNING: urlset sitemap returned 0 urls: {nested_url}; first_200_chars={snippet}",
+                    )
                 if max_urls_per_child > 0:
                     nested_rows = nested_rows[:max_urls_per_child]
                 rows.extend(nested_rows)
             continue
 
+        sm_root = _xml_root_localname(sm_xml)
         sm_rows = parse_urlset(sm_xml, source_sitemap_url=sm_url)
+        _append_debug(
+            active_debug_log,
+            f"Child sitemap parsed: url={sm_url}, root={sm_root}, urls_extracted={len(sm_rows)}",
+        )
+        if sm_root == "urlset" and not sm_rows:
+            snippet = sm_xml.strip().replace("\n", " ")[:200]
+            _append_debug(
+                active_debug_log,
+                f"WARNING: urlset sitemap returned 0 urls: {sm_url}; first_200_chars={snippet}",
+            )
         if max_urls_per_child > 0:
             sm_rows = sm_rows[:max_urls_per_child]
         rows.extend(sm_rows)
