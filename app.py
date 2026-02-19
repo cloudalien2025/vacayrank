@@ -487,13 +487,35 @@ def classify_url(url: str, cfg: ClassifierConfig) -> str:
     return "other"
 
 
+def classify_by_source_sitemap(source_sitemap: str) -> Optional[str]:
+    source = (source_sitemap or "").lower()
+
+    if "data_post-" in source:
+        return "blog_posts"
+    if "data_category-" in source:
+        return "categories"
+    if "static_pages-" in source:
+        return "static"
+    if "profile_search_results-" in source:
+        return "search"
+    if "profile-filename-reviews" in source or "review_filename" in source:
+        return "other"
+    if "photo_group_profile-" in source:
+        return "other"
+    if "/profile-filename-" in source and "reviews" not in source:
+        return "profiles"
+
+    return None
+
+
 def apply_classification(rows: List[UrlRow], cfg: ClassifierConfig) -> List[UrlRow]:
     out: List[UrlRow] = []
     for r in rows:
+        source_mapped_type = classify_by_source_sitemap(r.source_sitemap)
         out.append(
             UrlRow(
                 url=r.url,
-                url_type=classify_url(r.url, cfg),
+                url_type=source_mapped_type or classify_url(r.url, cfg),
                 source_sitemap=r.source_sitemap,
                 lastmod=r.lastmod,
             )
