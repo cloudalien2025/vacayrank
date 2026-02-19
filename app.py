@@ -781,6 +781,11 @@ def render_serp_gap_page() -> None:
         country = st.text_input("Country", value="US").strip()
         category = st.selectbox("Category", options=["Hotels", "Restaurants", "Activities", "Nightlife", "Shopping"])
         custom_seeds = st.text_area("Custom query seeds (one per line)", value="", height=120)
+        use_location_targeting = st.checkbox("Use SerpAPI location targeting (advanced)", value=False, disabled=True)
+        if use_location_targeting:
+            st.caption("Location targeting is currently unavailable in this release.")
+        else:
+            st.caption("Localization uses query text (destination + region) with hl/gl settings.")
         organic_pages = st.number_input("Organic pages to fetch", min_value=1, max_value=10, value=2)
         maps_pages = st.number_input("Maps pages to fetch", min_value=1, max_value=10, value=2)
         threshold = st.slider("Fuzzy threshold", min_value=0, max_value=100, value=88)
@@ -815,7 +820,6 @@ def render_serp_gap_page() -> None:
         st.stop()
 
     queries = build_query_seeds(destination, region, country, category, custom_seeds)
-    location_value = ", ".join([x for x in [destination, region, country] if x])
     raw_candidates: List[dict] = []
 
     try:
@@ -830,8 +834,6 @@ def render_serp_gap_page() -> None:
                     "num": "10",
                     "start": str(page_idx * 10),
                 }
-                if location_value:
-                    params["location"] = location_value
                 payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(serp_cache_age), bool(force_refresh), debug_log)
                 organic = extract_organic_candidates(payload)
                 _append_debug(debug_log, f"Organic extracted: query='{q}' page={page_idx + 1} count={len(organic)}")
@@ -849,8 +851,6 @@ def render_serp_gap_page() -> None:
                     "gl": (country or "us").lower(),
                     "start": str(page_idx * 20),
                 }
-                if location_value:
-                    params["location"] = location_value
                 payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(serp_cache_age), bool(force_refresh), debug_log)
                 maps = extract_maps_candidates(payload)
                 _append_debug(debug_log, f"Maps extracted: query='{maps_query}' page={page_idx + 1} count={len(maps)}")
