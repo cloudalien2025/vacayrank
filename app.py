@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import string
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
@@ -18,6 +19,7 @@ import streamlit as st
 
 try:
     from rapidfuzz import fuzz
+
     _HAS_RAPIDFUZZ = True
 except Exception:
     fuzz = None
@@ -29,58 +31,70 @@ DEFAULT_TIMEOUT_SECS = 20
 SERP_API_URL = "https://serpapi.com/search.json"
 XML_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-CATEGORY_QUERY_TEMPLATES = {
-    "Hotels": [
-        "hotels in {destination} {region}",
-        "best hotels in {destination} {region}",
-        "luxury hotels in {destination} {region}",
-        "ski resort hotels in {destination} {region}",
-        "{destination} {region} lodging",
-    ],
-    "Restaurants": [
-        "restaurants in {destination} {region}",
-        "best restaurants in {destination} {region}",
-        "fine dining in {destination} {region}",
-        "breakfast in {destination} {region}",
-        "{destination} {region} dinner",
-    ],
-    "Activities": [
-        "things to do in {destination} {region}",
-        "best activities in {destination} {region}",
-        "tours in {destination} {region}",
-        "{destination} {region} attractions",
-        "outdoor activities in {destination} {region}",
-    ],
-    "Nightlife": [
-        "bars in {destination} {region}",
-        "best bars in {destination} {region}",
-        "nightlife in {destination} {region}",
-        "live music in {destination} {region}",
-        "cocktail bar in {destination} {region}",
-    ],
-    "Shopping": [
-        "shopping in {destination} {region}",
-        "best shops in {destination} {region}",
-        "boutiques in {destination} {region}",
-        "souvenir shop in {destination} {region}",
-        "outlet in {destination} {region}",
-    ],
+CATEGORY_CONFIG = {
+    "Hotels": {
+        "query_templates": [
+            "hotels in {destination} {region}",
+            "best hotels in {destination} {region}",
+            "luxury hotels in {destination} {region}",
+            "{destination} {region} lodging",
+        ],
+        "inventory_url_contains_any": ["/listings/", "/hotels/", "/lodging/", "/stay/"],
+        "serp_entity_stopwords": ["hotel", "resort", "lodge", "inn", "suites", "collection", "club", "spa", "accommodations"],
+    },
+    "Restaurants": {
+        "query_templates": [
+            "restaurants in {destination} {region}",
+            "best restaurants in {destination} {region}",
+            "fine dining in {destination} {region}",
+            "{destination} {region} dinner",
+        ],
+        "inventory_url_contains_any": ["/listings/", "/restaurants/", "/restaurant/", "/dining/"],
+        "serp_entity_stopwords": ["restaurant", "grill", "kitchen", "eatery", "bar", "bistro", "cafe"],
+    },
+    "Bars": {
+        "query_templates": [
+            "bars in {destination} {region}",
+            "best bars in {destination} {region}",
+            "cocktail bars in {destination} {region}",
+            "apres ski bars in {destination} {region}",
+        ],
+        "inventory_url_contains_any": ["/listings/", "/bars/", "/nightlife/"],
+        "serp_entity_stopwords": ["bar", "pub", "lounge", "tavern", "nightclub", "cocktail"],
+    },
+    "Attractions": {
+        "query_templates": [
+            "attractions in {destination} {region}",
+            "things to do in {destination} {region}",
+            "best activities in {destination} {region}",
+            "{destination} {region} sightseeing",
+        ],
+        "inventory_url_contains_any": ["/listings/", "/activities/", "/things-to-do/", "/attractions/"],
+        "serp_entity_stopwords": ["attraction", "adventure", "tour", "experience", "activity", "park"],
+    },
+    "Shops": {
+        "query_templates": [
+            "shops in {destination} {region}",
+            "shopping in {destination} {region}",
+            "boutiques in {destination} {region}",
+            "gift shops in {destination} {region}",
+        ],
+        "inventory_url_contains_any": ["/listings/", "/shops/", "/shopping/"],
+        "serp_entity_stopwords": ["shop", "store", "boutique", "market", "outlet"],
+    },
+    "Ski Rentals": {
+        "query_templates": [
+            "ski rentals in {destination} {region}",
+            "snowboard rentals in {destination} {region}",
+            "ski shop rentals in {destination} {region}",
+            "equipment rentals in {destination} {region}",
+        ],
+        "inventory_url_contains_any": ["/listings/", "/rentals/", "/ski-rentals/"],
+        "serp_entity_stopwords": ["rental", "rentals", "ski", "snowboard", "equipment", "shop"],
+    },
 }
 
-GENERIC_LODGING_TOKENS = {
-    "hotel",
-    "resort",
-    "lodge",
-    "inn",
-    "suites",
-    "collection",
-    "luxury",
-    "mountain",
-    "retreat",
-    "spa",
-    "accommodations",
-    "club",
-}
+GENERIC_LODGING_TOKENS = {"hotel", "resort", "lodge", "inn", "suites", "collection", "club"}
 STOPWORDS = {"the", "a", "an", "and", "of", "at", "in", "on"}
 
 
@@ -244,14 +258,7 @@ def parse_urlset(xml_text: str, source_sitemap_url: str) -> List[UrlRow]:
         loc = node.find("sm:loc", XML_NS)
         lastmod = node.find("sm:lastmod", XML_NS)
         if loc is not None and loc.text:
-            rows.append(
-                UrlRow(
-                    url=loc.text.strip(),
-                    url_type="unclassified",
-                    source_sitemap=source_sitemap_url,
-                    lastmod=lastmod.text.strip() if (lastmod is not None and lastmod.text) else None,
-                )
-            )
+            rows.append(UrlRow(url=loc.text.strip(), url_type="unclassified", source_sitemap=source_sitemap_url, lastmod=lastmod.text.strip() if (lastmod is not None and lastmod.text) else None))
     return rows
 
 
@@ -313,13 +320,7 @@ def save_inventory_disk_cache(sitemap_index_url: str, stats: FetchStats, rows: L
 
 
 @st.cache_data(show_spinner=False)
-def fetch_inventory_live(
-    sitemap_index_url: str,
-    timeout_secs: int,
-    max_child_sitemaps: int,
-    max_urls_per_child: int,
-    debug_enabled: bool,
-) -> Tuple[List[str], List[UrlRow], List[str]]:
+def fetch_inventory_live(sitemap_index_url: str, timeout_secs: int, max_child_sitemaps: int, max_urls_per_child: int, debug_enabled: bool) -> Tuple[List[str], List[UrlRow], List[str]]:
     debug_log: List[str] = []
     dbg = debug_log if debug_enabled else None
 
@@ -344,41 +345,23 @@ def fetch_inventory_live(
     return child_sitemaps, rows, debug_log
 
 
-def build_inventory(
-    sitemap_index_url: str,
-    timeout_secs: int,
-    max_child_sitemaps: int,
-    max_urls_per_child: int,
-    disk_cache_max_age_hours: float,
-    force_refresh: bool,
-    debug_enabled: bool,
-) -> Tuple[FetchStats, List[UrlRow], List[str]]:
+def build_inventory(sitemap_index_url: str, timeout_secs: int, max_child_sitemaps: int, max_urls_per_child: int, disk_cache_max_age_hours: float, force_refresh: bool, debug_enabled: bool) -> Tuple[FetchStats, List[UrlRow], List[str]]:
     started = time.time()
     if not force_refresh:
         disk = load_inventory_disk_cache(sitemap_index_url, disk_cache_max_age_hours)
         if disk is not None:
             stats, rows = disk
-            return (
-                FetchStats(
-                    sitemap_index_url=stats.sitemap_index_url,
-                    fetched_at_utc=stats.fetched_at_utc,
-                    child_sitemaps_found=stats.child_sitemaps_found,
-                    child_sitemaps_fetched=stats.child_sitemaps_fetched,
-                    urls_found=stats.urls_found,
-                    elapsed_seconds=round(time.time() - started, 3),
-                    cache_used=True,
-                ),
-                apply_classification(rows, DEFAULT_CLASSIFIER),
-                ["Loaded inventory from disk cache."],
-            )
+            return FetchStats(
+                sitemap_index_url=stats.sitemap_index_url,
+                fetched_at_utc=stats.fetched_at_utc,
+                child_sitemaps_found=stats.child_sitemaps_found,
+                child_sitemaps_fetched=stats.child_sitemaps_fetched,
+                urls_found=stats.urls_found,
+                elapsed_seconds=round(time.time() - started, 3),
+                cache_used=True,
+            ), apply_classification(rows, DEFAULT_CLASSIFIER), ["Loaded inventory from disk cache."]
 
-    child_sitemaps, rows, debug_log = fetch_inventory_live(
-        sitemap_index_url=sitemap_index_url,
-        timeout_secs=timeout_secs,
-        max_child_sitemaps=max_child_sitemaps,
-        max_urls_per_child=max_urls_per_child,
-        debug_enabled=debug_enabled,
-    )
+    child_sitemaps, rows, debug_log = fetch_inventory_live(sitemap_index_url, timeout_secs, max_child_sitemaps, max_urls_per_child, debug_enabled)
     rows = apply_classification(rows, DEFAULT_CLASSIFIER)
     stats = FetchStats(
         sitemap_index_url=sitemap_index_url,
@@ -421,24 +404,33 @@ def _region_tokens(region: str) -> Set[str]:
     return tokens
 
 
-def clean_candidate_name(name: str, destination: str, region: str) -> str:
+def _country_tokens(country: str) -> Set[str]:
+    c = country.strip().lower()
+    if c in {"us", "usa", "united states", "united states of america"}:
+        return {"us", "usa", "united", "states", "america"}
+    return set(_tokenize(country))
+
+
+def clean_candidate_name(name: str, destination: str, region: str, country: str, category_stopwords: List[str]) -> str:
     txt = name.lower().replace("—", "-").replace("–", "-")
     if " - " in txt:
         txt = txt.rsplit(" - ", 1)[-1]
     txt = re.sub(r"[^a-z0-9\s]", " ", txt)
     tokens = [t for t in txt.split() if t]
-    remove = set(_tokenize(destination)) | _region_tokens(region) | GENERIC_LODGING_TOKENS
+    remove = set(_tokenize(destination)) | _region_tokens(region) | _country_tokens(country) | set(category_stopwords)
     kept = [t for t in tokens if t not in remove]
     return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
 
-def inventory_name_from_url(url: str) -> str:
+def inventory_name_from_url(url: str, category_stopwords: List[str], destination: str, region: str, country: str) -> str:
     parsed = urlparse(url)
-    segment = (parsed.path.strip("/").split("/")[-1] if parsed.path.strip("/") else "")
+    segment = parsed.path.strip("/").split("/")[-1] if parsed.path.strip("/") else ""
     segment = segment.replace("-", " ").replace("_", " ")
     segment = re.sub(r"[^a-z0-9\s]", " ", segment.lower())
-    tokens = [t for t in segment.split() if t and t not in {"hotel", "resort", "lodge", "inn", "suites", "collection", "club"}]
-    return re.sub(r"\s+", " ", " ".join(tokens)).strip()
+    tokens = [t for t in segment.split() if t]
+    remove = GENERIC_LODGING_TOKENS | set(category_stopwords) | set(_tokenize(destination)) | _region_tokens(region) | _country_tokens(country)
+    kept = [t for t in tokens if t not in remove]
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
 
 def match_score(a: str, b: str) -> int:
@@ -450,11 +442,11 @@ def match_score(a: str, b: str) -> int:
         a_set, b_set = set(a.split()), set(b.split())
         if not a_set or not b_set:
             return 0
-        jacc = len(a_set & b_set) / len(a_set | b_set)
-        base = int(round(jacc * 100))
-        if a.startswith(b) or b.startswith(a):
-            base += 6
-        if " ".join(sorted(a_set)).startswith(" ".join(sorted(b_set))) or " ".join(sorted(b_set)).startswith(" ".join(sorted(a_set))):
+        jaccard = len(a_set & b_set) / len(a_set | b_set)
+        base = int(round(jaccard * 100))
+        if a_set.issubset(b_set) or b_set.issubset(a_set):
+            base += 8
+        elif a in b or b in a:
             base += 4
     a_set, b_set = set(a.split()), set(b.split())
     if a_set and b_set and (a_set.issubset(b_set) or b_set.issubset(a_set)):
@@ -470,11 +462,11 @@ def _normalize_domain(url: str) -> str:
         return ""
 
 
-def build_inventory_entities(rows: List[UrlRow], destination: str, region: str) -> List[InventoryEntity]:
+def build_inventory_entities(rows: List[UrlRow], destination: str, region: str, country: str, category_cfg: dict) -> List[InventoryEntity]:
     entities: List[InventoryEntity] = []
+    stopwords = category_cfg.get("serp_entity_stopwords", [])
     for row in rows:
-        name_key = inventory_name_from_url(row.url)
-        name_key = clean_candidate_name(name_key, destination, region)
+        name_key = inventory_name_from_url(row.url, stopwords, destination, region, country)
         entities.append(InventoryEntity(url=row.url, domain=_normalize_domain(row.url), name_key=name_key))
     return entities
 
@@ -508,18 +500,7 @@ def save_serp_disk_cache(parts: Dict[str, str], response_json: dict) -> None:
         return
     cache_path = _serp_cache_paths(_serp_cache_key(parts))
     with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "metadata": {
-                    "fetched_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "params": parts,
-                },
-                "raw_json": response_json,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+        json.dump({"metadata": {"fetched_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "params": parts}, "raw_json": response_json}, f, ensure_ascii=False, indent=2)
 
 
 @st.cache_data(show_spinner=False)
@@ -566,30 +547,17 @@ def build_query_text(template: str, destination: str, region: str) -> str:
     return query
 
 
-def build_query_seeds(destination: str, region: str, category: str, custom_seeds: str) -> List[str]:
+def build_query_seeds(destination: str, region: str, category_cfg: dict, custom_seeds: str) -> List[str]:
     if custom_seeds.strip():
         return dedupe_preserve_order([line.strip() for line in custom_seeds.splitlines() if line.strip()])
-    templates = CATEGORY_QUERY_TEMPLATES.get(category, [])
+    templates = category_cfg.get("query_templates", [])
     return [build_query_text(t, destination, region) for t in templates]
 
 
 def extract_organic_candidates(payload: dict, source_query: str) -> List[dict]:
     output = []
     for item in payload.get("organic_results", []) or []:
-        output.append(
-            {
-                "candidate_name": item.get("title", ""),
-                "address": "",
-                "phone": "",
-                "rating": None,
-                "reviews": None,
-                "website": item.get("link", ""),
-                "place_id": item.get("place_id") or item.get("result_id") or "",
-                "rank": item.get("position"),
-                "source_query": source_query,
-                "source_engine": "google",
-            }
-        )
+        output.append({"candidate_name": item.get("title", ""), "address": "", "phone": "", "rating": None, "reviews": None, "website": item.get("link", ""), "place_id": item.get("place_id") or item.get("result_id") or "", "rank": item.get("position"), "source_query": source_query, "source_engine": "google"})
     return output
 
 
@@ -608,40 +576,58 @@ def _to_int(value: object) -> Optional[int]:
 
 
 def extract_maps_candidates(payload: dict, source_query: str) -> List[dict]:
+    rows = payload.get("local_results", []) or payload.get("places_results", []) or []
     output = []
-    for item in payload.get("local_results", []) or []:
-        output.append(
-            {
-                "candidate_name": item.get("title") or item.get("name") or "",
-                "address": item.get("address", ""),
-                "phone": item.get("phone", ""),
-                "rating": _to_float(item.get("rating")),
-                "reviews": _to_int(item.get("reviews") or item.get("reviews_original")),
-                "website": item.get("website", ""),
-                "place_id": item.get("place_id") or item.get("data_id") or item.get("cid") or item.get("data_cid") or "",
-                "rank": item.get("position"),
-                "source_query": source_query,
-                "source_engine": "google_maps",
-            }
-        )
+    for item in rows:
+        output.append({
+            "candidate_name": item.get("title") or item.get("name") or "",
+            "address": item.get("address", ""),
+            "phone": item.get("phone", ""),
+            "rating": _to_float(item.get("rating")),
+            "reviews": _to_int(item.get("reviews") or item.get("reviews_original")),
+            "website": item.get("website", ""),
+            "place_id": item.get("place_id") or item.get("data_id") or item.get("cid") or item.get("data_cid") or "",
+            "rank": item.get("position"),
+            "source_query": source_query,
+            "source_engine": "google_maps",
+        })
     return output
 
 
-def aggregate_candidates(raw_candidates: List[dict], destination: str, region: str) -> List[dict]:
+def extract_city_from_address(address: str) -> Optional[str]:
+    if not address or not address.strip():
+        return None
+    parts = [p.strip() for p in address.split(",") if p.strip()]
+    if len(parts) >= 3:
+        city_candidate = parts[-2]
+    elif len(parts) == 2:
+        first, second = parts
+        if any(ch.isdigit() for ch in first):
+            city_candidate = second
+        else:
+            city_candidate = first
+    else:
+        return None
+    city_candidate = re.sub(f"[{re.escape(string.punctuation)}]", " ", city_candidate.lower())
+    city_candidate = re.sub(r"\b[a-z]{2}\s*\d{4,}\b", " ", city_candidate)
+    city_candidate = re.sub(r"\s+", " ", city_candidate).strip()
+    if not city_candidate:
+        return None
+    words = [w for w in city_candidate.split() if not re.fullmatch(r"[a-z]{2}", w) and not w.isdigit()]
+    if not words:
+        return None
+    return " ".join(words)
+
+
+def aggregate_candidates(raw_candidates: List[dict], destination: str, region: str, country: str, category_cfg: dict) -> List[dict]:
     merged: Dict[str, dict] = {}
+    stopwords = category_cfg.get("serp_entity_stopwords", [])
     for item in raw_candidates:
-        normalized_name = clean_candidate_name(item.get("candidate_name", ""), destination, region)
+        normalized_name = clean_candidate_name(item.get("candidate_name", ""), destination, region, country, stopwords)
         domain = _normalize_domain(item.get("website", ""))
         key = domain or f"{normalized_name}|{(item.get('address') or '').lower()}"
         if key not in merged:
-            merged[key] = {
-                **item,
-                "name_key": normalized_name,
-                "domain": domain,
-                "engines": {item.get("source_engine", "")},
-                "queries": {item.get("source_query", "")},
-                "reviews": item.get("reviews") or 0,
-            }
+            merged[key] = {**item, "name_key": normalized_name, "domain": domain, "engines": {item.get("source_engine", "")}, "queries": {item.get("source_query", "")}, "reviews": item.get("reviews") or 0}
         else:
             cur = merged[key]
             cur["engines"].add(item.get("source_engine", ""))
@@ -653,6 +639,32 @@ def aggregate_candidates(raw_candidates: List[dict], destination: str, region: s
             if (cur.get("rating") or 0) < (item.get("rating") or 0):
                 cur["rating"] = item.get("rating")
     return list(merged.values())
+
+
+def apply_geo_filter(candidates: List[dict], destination: str, strict_city_match: bool, allowed_cities: Set[str]) -> Tuple[List[dict], List[dict], List[dict]]:
+    if not strict_city_match:
+        for candidate in candidates:
+            candidate["geo_bucket"] = "In Scope"
+            candidate["candidate_city"] = extract_city_from_address(candidate.get("address", ""))
+        return candidates, [], []
+
+    destination_city = _clean_text(destination)
+    in_scope: List[dict] = []
+    out_scope: List[dict] = []
+    unknown: List[dict] = []
+    for candidate in candidates:
+        city = extract_city_from_address(candidate.get("address", ""))
+        candidate["candidate_city"] = city or ""
+        if city is None:
+            candidate["geo_bucket"] = "Unknown Location"
+            unknown.append(candidate)
+        elif city == destination_city or city in allowed_cities:
+            candidate["geo_bucket"] = "In Scope"
+            in_scope.append(candidate)
+        else:
+            candidate["geo_bucket"] = "Out of Scope"
+            out_scope.append(candidate)
+    return in_scope, out_scope, unknown
 
 
 def score_and_partition(candidates: List[dict], inventory_entities: List[InventoryEntity], threshold: int) -> Tuple[List[dict], List[dict], List[dict]]:
@@ -668,28 +680,21 @@ def score_and_partition(candidates: List[dict], inventory_entities: List[Invento
     for candidate in candidates:
         best_score = 0
         best_url = ""
-        best_name = ""
-
         c_domain = candidate.get("domain", "")
         if c_domain and c_domain in by_domain:
             best = by_domain[c_domain][0]
             best_score = 100
             best_url = best.url
-            best_name = best.name_key
         else:
             c_name = candidate.get("name_key", "")
             for entity in inventory_entities:
                 score = match_score(c_name, entity.name_key)
-                if c_domain and c_domain and c_domain in entity.url:
-                    score = min(100, score + 5)
                 if score > best_score:
                     best_score = score
                     best_url = entity.url
-                    best_name = entity.name_key
 
         candidate["best_match_url"] = best_url
         candidate["best_match_score"] = best_score
-        candidate["best_match_name_key"] = best_name
 
         cscore = 0
         if "google_maps" in candidate.get("engines", set()):
@@ -725,9 +730,9 @@ def listing_display_name(url: str) -> str:
     return re.sub(r"\s+", " ", slug).strip()
 
 
-def listing_name_key(url: str, destination: str, region: str) -> str:
+def listing_name_key(url: str, destination: str, region: str, category_stopwords: List[str]) -> str:
     tokens = [t for t in listing_display_name(url).split() if t]
-    remove = STOPWORDS | GENERIC_LODGING_TOKENS | set(_tokenize(destination)) | _region_tokens(region)
+    remove = STOPWORDS | GENERIC_LODGING_TOKENS | set(category_stopwords) | set(_tokenize(destination)) | _region_tokens(region)
     kept = [t for t in tokens if t not in remove]
     return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
@@ -737,28 +742,23 @@ def choose_canonical_name(display_names: List[str]) -> str:
     return scored[0] if scored else ""
 
 
-def _listing_subset(rows: List[UrlRow], listings_only: bool) -> List[UrlRow]:
-    if not listings_only:
-        return rows
-    return [r for r in rows if "/listings/" in r.url.lower() or r.url_type == "profiles"]
+def category_inventory_rows(rows: List[UrlRow], category_cfg: dict) -> List[UrlRow]:
+    patterns = [p.lower() for p in category_cfg.get("inventory_url_contains_any", [])]
+    out = []
+    for r in rows:
+        u = r.url.lower()
+        if r.url_type == "profiles" or any(p in u for p in patterns):
+            out.append(r)
+    return out
 
 
-def detect_duplicates(rows: List[UrlRow], destination: str, region: str, threshold: int, min_cluster_size: int, listings_only: bool) -> Tuple[List[dict], List[dict], int]:
-    listing_rows = _listing_subset(rows, listings_only)
-    items = []
-    for row in listing_rows:
-        items.append(
-            {
-                "url": row.url,
-                "display_name": listing_display_name(row.url),
-                "name_key": listing_name_key(row.url, destination, region),
-            }
-        )
+def detect_duplicates(rows: List[UrlRow], destination: str, region: str, category_cfg: dict, threshold: int = 92, min_cluster_size: int = 2) -> Tuple[List[dict], List[dict], int]:
+    listing_rows = category_inventory_rows(rows, category_cfg)
+    items = [{"url": r.url, "display_name": listing_display_name(r.url), "name_key": listing_name_key(r.url, destination, region, category_cfg.get("serp_entity_stopwords", []))} for r in listing_rows]
 
     clusters: List[dict] = []
     members: List[dict] = []
     used_urls: Set[str] = set()
-
     exact_groups: Dict[str, List[dict]] = {}
     for item in items:
         exact_groups.setdefault(item["name_key"], []).append(item)
@@ -768,64 +768,44 @@ def detect_duplicates(rows: List[UrlRow], destination: str, region: str, thresho
         if key and len(group) >= min_cluster_size:
             cid = f"DUP-{cluster_id:04d}"
             cluster_id += 1
-            urls = [g["url"] for g in group]
-            canonical = choose_canonical_name([g["display_name"] for g in group])
-            clusters.append(
-                {
-                    "cluster_id": cid,
-                    "confidence": "HIGH",
-                    "canonical_suggested_name": canonical,
-                    "cluster_size": len(group),
-                    "urls": "\n".join(urls),
-                    "example_pair_score": 100,
-                }
-            )
+            clusters.append({"cluster_id": cid, "confidence": "HIGH", "canonical_suggested_name": choose_canonical_name([g["display_name"] for g in group]), "cluster_size": len(group), "urls": "\n".join([g["url"] for g in group]), "example_pair_score": 100})
             for g in group:
                 used_urls.add(g["url"])
                 members.append({"cluster_id": cid, "confidence": "HIGH", **g})
 
     remaining = [item for item in items if item["url"] not in used_urls and item["name_key"]]
+    compare_groups: List[List[dict]]
     if len(remaining) > 2000:
         blocks: Dict[str, List[dict]] = {}
         for item in remaining:
-            first = item["name_key"].split()[0][0] if item["name_key"].split() else "#"
-            blocks.setdefault(first, []).append(item)
+            k = item["name_key"].split()[0][0] if item["name_key"].split() else "#"
+            blocks.setdefault(k, []).append(item)
         compare_groups = list(blocks.values())
     else:
         compare_groups = [remaining]
 
-    seen_in_medium: Set[str] = set()
+    seen: Set[str] = set()
     for group in compare_groups:
         for i in range(len(group)):
-            a = group[i]
-            if a["url"] in seen_in_medium:
+            base = group[i]
+            if base["url"] in seen:
                 continue
-            cluster_items = [a]
+            cluster_items = [base]
             best_example = 0
             for j in range(i + 1, len(group)):
-                b = group[j]
-                if b["url"] in seen_in_medium:
+                other = group[j]
+                if other["url"] in seen:
                     continue
-                score = match_score(a["name_key"], b["name_key"])
+                score = match_score(base["name_key"], other["name_key"])
                 if score >= threshold:
-                    cluster_items.append(b)
+                    cluster_items.append(other)
                     best_example = max(best_example, score)
             if len(cluster_items) >= min_cluster_size:
                 cid = f"DUP-{cluster_id:04d}"
                 cluster_id += 1
-                canonical = choose_canonical_name([x["display_name"] for x in cluster_items])
-                clusters.append(
-                    {
-                        "cluster_id": cid,
-                        "confidence": "MEDIUM",
-                        "canonical_suggested_name": canonical,
-                        "cluster_size": len(cluster_items),
-                        "urls": "\n".join([x["url"] for x in cluster_items]),
-                        "example_pair_score": best_example,
-                    }
-                )
+                clusters.append({"cluster_id": cid, "confidence": "MEDIUM", "canonical_suggested_name": choose_canonical_name([x["display_name"] for x in cluster_items]), "cluster_size": len(cluster_items), "urls": "\n".join([x["url"] for x in cluster_items]), "example_pair_score": best_example})
                 for x in cluster_items:
-                    seen_in_medium.add(x["url"])
+                    seen.add(x["url"])
                     members.append({"cluster_id": cid, "confidence": "MEDIUM", **x})
 
     clusters.sort(key=lambda x: (x["confidence"] != "HIGH", -x["cluster_size"], x["cluster_id"]))
@@ -851,26 +831,16 @@ def render_inventory_page() -> None:
 
     try:
         with st.spinner("Fetching and parsing sitemaps..."):
-            stats, rows, debug_log = build_inventory(
-                sitemap_index_url=sitemap_index_url,
-                timeout_secs=int(timeout_secs),
-                max_child_sitemaps=int(max_child_sitemaps),
-                max_urls_per_child=int(max_urls_per_child),
-                disk_cache_max_age_hours=float(disk_cache_max_age_hours),
-                force_refresh=bool(force_refresh),
-                debug_enabled=bool(show_debug_log),
-            )
+            stats, rows, debug_log = build_inventory(sitemap_index_url=sitemap_index_url, timeout_secs=int(timeout_secs), max_child_sitemaps=int(max_child_sitemaps), max_urls_per_child=int(max_urls_per_child), disk_cache_max_age_hours=float(disk_cache_max_age_hours), force_refresh=bool(force_refresh), debug_enabled=bool(show_debug_log))
     except Exception as err:
         st.error(f"Inventory scan failed: {err}")
         return
 
     st.metric("Inventory URLs", stats.urls_found)
     st.caption(f"Fetched at: {stats.fetched_at_utc} • Cache used: {'Yes' if stats.cache_used else 'No'} • Elapsed: {stats.elapsed_seconds}s")
-
     table = [{"url": r.url, "url_type": r.url_type, "source_sitemap": r.source_sitemap, "lastmod": r.lastmod or ""} for r in rows]
     st.dataframe(table, use_container_width=True, height=460)
     st.download_button("Download inventory CSV", data=rows_to_csv_bytes(table), file_name="vacayrank_inventory.csv", mime="text/csv")
-
     if show_debug_log:
         st.subheader("Debug log")
         st.code("\n".join(debug_log) if debug_log else "No debug entries", language="text")
@@ -887,9 +857,51 @@ def _extract_serp_api_key() -> str:
     return key.strip()
 
 
+def _safe_category_config() -> dict:
+    cfg = CATEGORY_CONFIG
+    with st.sidebar:
+        load_json_cfg = st.checkbox("Load category config from JSON (advanced)", value=False)
+        if load_json_cfg:
+            raw = st.text_area("Category config JSON", value=json.dumps(CATEGORY_CONFIG, indent=2), height=220)
+            try:
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict) or not parsed:
+                    raise ValueError("JSON must be a non-empty object of category definitions")
+                cfg = parsed
+                st.success("Using JSON category config for this run.")
+            except Exception as err:
+                st.error(f"Invalid category config JSON; using built-in defaults. Error: {err}")
+                cfg = CATEGORY_CONFIG
+    return cfg
+
+
+def _display_candidate_rows(items: List[dict]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for item in items:
+        rows.append({
+            "candidate_name": item.get("candidate_name", ""),
+            "name_key": item.get("name_key", ""),
+            "candidate_city": item.get("candidate_city", ""),
+            "address": item.get("address", ""),
+            "phone": item.get("phone", ""),
+            "rating": item.get("rating"),
+            "reviews": item.get("reviews"),
+            "website": item.get("website", ""),
+            "candidate_score": item.get("candidate_score", 0),
+            "best_match_url": item.get("best_match_url", ""),
+            "best_match_score": item.get("best_match_score", 0),
+            "queries_count": len(item.get("queries", set())),
+            "engines": ",".join(sorted([e for e in item.get("engines", set()) if e])),
+            "place_id": item.get("place_id", ""),
+        })
+    return rows
+
+
 def render_serp_gap_page() -> None:
     st.subheader("Milestone 2 — SERP Gap")
     api_key = _extract_serp_api_key()
+    category_config = _safe_category_config()
+    category_keys = list(category_config.keys())
 
     with st.sidebar:
         st.header("SERP Gap Settings")
@@ -897,178 +909,159 @@ def render_serp_gap_page() -> None:
         destination = st.text_input("Destination", value="Vail").strip()
         region = st.text_input("Region/State", value="CO").strip()
         country = st.text_input("Country", value="US").strip()
-        category = st.selectbox("Category", options=["Hotels", "Restaurants", "Activities", "Nightlife", "Shopping"], index=0)
-        custom_query_seeds = st.text_area("Custom query seeds (one per line)", value="", height=120)
-        organic_pages = st.number_input("Organic pages", min_value=1, max_value=5, value=2)
-        maps_pages = st.number_input("Maps pages", min_value=1, max_value=5, value=2)
-        fuzzy_threshold = st.slider("Fuzzy threshold", min_value=0, max_value=100, value=88)
+        if st.button("Select all categories"):
+            st.session_state["selected_categories"] = category_keys
+        selected_categories = st.multiselect("Categories to scan", options=category_keys, default=st.session_state.get("selected_categories", category_keys))
+        st.session_state["selected_categories"] = selected_categories
+        custom_query_seeds = st.text_area("Custom query seeds (one per line, applies to all selected categories)", value="", height=120)
+        organic_pages = st.number_input("Organic pages to fetch", min_value=1, max_value=5, value=2)
+        maps_pages = st.number_input("Maps pages to fetch", min_value=1, max_value=5, value=2)
+        fuzzy_threshold = st.slider("Matching threshold", min_value=0, max_value=100, value=88)
         cache_hours = st.number_input("Use disk cache if newer than (hours)", min_value=0.0, max_value=168.0, value=12.0)
-        force_refresh = st.checkbox("Force refresh (ignore disk cache)", value=False)
+        force_refresh = st.checkbox("Force refresh", value=False)
         show_debug_log = st.checkbox("Show debug log", value=False)
+        strict_city_match = st.checkbox("Strict city match", value=True)
+        allowed_cities_raw = st.text_input("Allowed cities (comma separated, optional)", value="")
         use_location_targeting = st.checkbox("Use SerpAPI location targeting (advanced)", value=False)
-        st.caption("Location targeting requires SerpAPI Locations API resolution and is intentionally disabled in this patch.")
-        run_disabled = not bool(api_key)
-        run = st.button("Run SERP Gap Scan", type="primary", disabled=run_disabled)
+        st.caption("Advanced location targeting is intentionally not used here; localization is query + gl/hl only.")
+        run = st.button("Run SERP Gap Scan", type="primary", disabled=not bool(api_key))
 
     if not api_key:
         st.error("SERPAPI_API_KEY is missing. Set it in Streamlit secrets or environment variables to enable Milestone 2.")
-
     if use_location_targeting:
-        st.info("Advanced location targeting was selected, but this release still runs query-based localization and omits the location parameter.")
-
+        st.info("Advanced location targeting selected. This build intentionally omits the SerpAPI location parameter to avoid unsupported location errors.")
     if not run:
         return
-
-    debug_log: List[str] = []
-    queries = build_query_seeds(destination, region, category, custom_query_seeds)
-    if not queries:
-        st.error("No queries were generated. Add a destination/category or custom query seeds.")
+    if not selected_categories:
+        st.error("Select at least one category to run the matrix scan.")
         return
 
+    allowed_cities = {_clean_text(x) for x in allowed_cities_raw.split(",") if x.strip()}
+    debug_log: List[str] = []
+    gl_code = (country or "US").strip().lower()
+
     try:
-        _, inventory_rows, _ = build_inventory(
-            sitemap_index_url=sitemap_index_url,
-            timeout_secs=DEFAULT_TIMEOUT_SECS,
-            max_child_sitemaps=200,
-            max_urls_per_child=0,
-            disk_cache_max_age_hours=float(cache_hours),
-            force_refresh=bool(force_refresh),
-            debug_enabled=False,
-        )
+        _, inventory_rows, _ = build_inventory(sitemap_index_url=sitemap_index_url, timeout_secs=DEFAULT_TIMEOUT_SECS, max_child_sitemaps=200, max_urls_per_child=0, disk_cache_max_age_hours=float(cache_hours), force_refresh=bool(force_refresh), debug_enabled=False)
     except Exception as err:
         st.error(f"Failed to load inventory: {err}")
         return
 
-    raw_candidates: List[dict] = []
-    gl_code = (country or "US").strip().lower()
-
-    try:
+    results_by_category: Dict[str, dict] = {}
+    for category in selected_categories:
+        cfg = category_config.get(category, {})
+        queries = build_query_seeds(destination, region, cfg, custom_query_seeds)
+        if not queries:
+            results_by_category[category] = {"inventory_rows": category_inventory_rows(inventory_rows, cfg), "candidates": [], "in_scope": [], "missing": [], "possible": [], "listed": [], "out_scope": [], "unknown": [], "duplicates": ([], [], 0)}
+            continue
+        raw_candidates: List[dict] = []
         for query in queries:
             for page_idx in range(int(organic_pages)):
-                params = {
-                    "engine": "google",
-                    "q": query,
-                    "api_key": api_key,
-                    "hl": "en",
-                    "gl": gl_code,
-                    "num": "10",
-                    "start": str(page_idx * 10),
-                }
-                payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(cache_hours), bool(force_refresh), debug_log)
-                extracted = extract_organic_candidates(payload, query)
-                _append_debug(debug_log, f"engine=google page_start={page_idx * 10} candidates={len(extracted)} query={query}")
-                raw_candidates.extend(extracted)
-
+                params = {"engine": "google", "q": query, "api_key": api_key, "hl": "en", "gl": gl_code, "num": "10", "start": str(page_idx * 10)}
+                try:
+                    payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(cache_hours), bool(force_refresh), debug_log)
+                    extracted = extract_organic_candidates(payload, query)
+                    raw_candidates.extend(extracted)
+                    _append_debug(debug_log, f"{category} query={query} engine=google start={page_idx * 10} extracted={len(extracted)}")
+                except Exception as err:
+                    _append_debug(debug_log, f"{category} query={query} engine=google error={err}")
             for page_idx in range(int(maps_pages)):
-                params = {
-                    "engine": "google_maps",
-                    "q": query,
-                    "api_key": api_key,
-                    "hl": "en",
-                    "gl": gl_code,
-                    "start": str(page_idx * 20),
-                }
-                payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(cache_hours), bool(force_refresh), debug_log)
-                extracted = extract_maps_candidates(payload, query)
-                _append_debug(debug_log, f"engine=google_maps page_start={page_idx * 20} candidates={len(extracted)} query={query}")
-                raw_candidates.extend(extracted)
-    except Exception as err:
-        st.error(f"SERP scan failed: {err}")
-        if show_debug_log:
-            st.code("\n".join(debug_log), language="text")
-        return
+                params = {"engine": "google_maps", "q": query, "api_key": api_key, "hl": "en", "gl": gl_code, "start": str(page_idx * 20)}
+                try:
+                    payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(cache_hours), bool(force_refresh), debug_log)
+                    extracted = extract_maps_candidates(payload, query)
+                    raw_candidates.extend(extracted)
+                    _append_debug(debug_log, f"{category} query={query} engine=google_maps start={page_idx * 20} extracted={len(extracted)}")
+                except Exception as err:
+                    _append_debug(debug_log, f"{category} query={query} engine=google_maps error={err}")
 
-    candidates = aggregate_candidates(raw_candidates, destination, region)
-    inventory_entities = build_inventory_entities(inventory_rows, destination, region)
-    missing, possible, listed = score_and_partition(candidates, inventory_entities, int(fuzzy_threshold))
+        candidates = aggregate_candidates(raw_candidates, destination, region, country, cfg)
+        in_scope, out_scope, unknown = apply_geo_filter(candidates, destination, strict_city_match, allowed_cities)
+        _append_debug(debug_log, f"{category} geo_stats total={len(candidates)} in_scope={len(in_scope)} out_scope={len(out_scope)} unknown={len(unknown)}")
 
-    listings_inventory = [r for r in inventory_rows if "/listings/" in r.url.lower() or r.url_type == "profiles"]
-    st.subheader("Summary")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Inventory count", len(listings_inventory))
-    m2.metric("SERP candidates discovered", len(candidates))
-    m3.metric("Missing", len(missing))
-    m4.metric("Possible matches", len(possible))
-    m5.metric("Already listed", len(listed))
+        category_inventory = category_inventory_rows(inventory_rows, cfg)
+        inventory_entities = build_inventory_entities(category_inventory, destination, region, country, cfg)
+        missing, possible, listed = score_and_partition(in_scope, inventory_entities, int(fuzzy_threshold))
+        dup_clusters, dup_members, dup_scanned = detect_duplicates(inventory_rows, destination, region, cfg)
 
-    def to_display_rows(items: List[dict]) -> List[Dict[str, object]]:
-        display = []
-        for item in items:
-            display.append(
-                {
-                    "candidate_name": item.get("candidate_name", ""),
-                    "name_key": item.get("name_key", ""),
-                    "address": item.get("address", ""),
-                    "phone": item.get("phone", ""),
-                    "rating": item.get("rating"),
-                    "reviews": item.get("reviews"),
-                    "website": item.get("website", ""),
-                    "candidate_score": item.get("candidate_score", 0),
-                    "best_match_url": item.get("best_match_url", ""),
-                    "best_match_score": item.get("best_match_score", 0),
-                    "best_match_name_key": item.get("best_match_name_key", ""),
-                    "queries_count": len(item.get("queries", set())),
-                    "engines": ",".join(sorted([e for e in item.get("engines", set()) if e])),
-                    "place_id": item.get("place_id", ""),
-                }
-            )
-        return display
+        results_by_category[category] = {
+            "inventory_rows": category_inventory,
+            "candidates": candidates,
+            "in_scope": in_scope,
+            "missing": missing,
+            "possible": possible,
+            "listed": listed,
+            "out_scope": out_scope,
+            "unknown": unknown,
+            "duplicates": (dup_clusters, dup_members, dup_scanned),
+        }
 
-    dup_listings_only = st.checkbox("Duplicates: Listings-only", value=True)
-    dup_threshold = st.slider("Duplicates fuzzy threshold", min_value=80, max_value=100, value=92)
-    dup_min_size = st.number_input("Duplicates min cluster size", min_value=2, max_value=20, value=2)
+    matrix_rows = []
+    for category in selected_categories:
+        r = results_by_category[category]
+        matrix_rows.append({
+            "Category": category,
+            "Inventory": len(r["inventory_rows"]),
+            "SERP Found": len(r["candidates"]),
+            "In Scope": len(r["in_scope"]),
+            "Missing": len(r["missing"]),
+            "Possible": len(r["possible"]),
+            "Already": len(r["listed"]),
+            "Out of Scope": len(r["out_scope"]),
+            "Unknown Location": len(r["unknown"]),
+        })
 
-    dup_clusters, dup_members, dup_scanned = detect_duplicates(
-        rows=inventory_rows,
-        destination=destination,
-        region=region,
-        threshold=int(dup_threshold),
-        min_cluster_size=int(dup_min_size),
-        listings_only=bool(dup_listings_only),
-    )
+    st.subheader("Category Matrix Summary")
+    st.dataframe(matrix_rows, use_container_width=True)
+    totals = {
+        "total_candidates": sum(x["SERP Found"] for x in matrix_rows),
+        "in_scope": sum(x["In Scope"] for x in matrix_rows),
+        "out_scope": sum(x["Out of Scope"] for x in matrix_rows),
+        "unknown": sum(x["Unknown Location"] for x in matrix_rows),
+    }
+    a, b, c, d = st.columns(4)
+    a.metric("Total candidates discovered", totals["total_candidates"])
+    b.metric("In scope", totals["in_scope"])
+    c.metric("Out of scope", totals["out_scope"])
+    d.metric("Unknown location", totals["unknown"])
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Missing", "Possible Matches", "Already Listed", "Duplicates"])
-    with tab1:
-        rows = to_display_rows(missing)
-        st.dataframe(rows, use_container_width=True, height=460)
-        st.download_button("Download Missing CSV", data=rows_to_csv_bytes(rows), file_name="vacayrank_missing.csv", mime="text/csv")
-    with tab2:
-        rows = to_display_rows(possible)
-        st.dataframe(rows, use_container_width=True, height=460)
-        st.download_button("Download Possible Matches CSV", data=rows_to_csv_bytes(rows), file_name="vacayrank_possible_matches.csv", mime="text/csv")
-    with tab3:
-        rows = to_display_rows(listed)
-        st.dataframe(rows, use_container_width=True, height=460)
-        st.download_button("Download Already Listed CSV", data=rows_to_csv_bytes(rows), file_name="vacayrank_already_listed.csv", mime="text/csv")
-    with tab4:
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Listing pages scanned", dup_scanned)
-        d2.metric("Clusters found", len(dup_clusters))
-        d3.metric("Total URLs clustered", len(dup_members))
-        if not dup_clusters:
-            st.info("No duplicates found for the selected settings.")
-        else:
-            st.dataframe(dup_clusters, use_container_width=True, height=350)
-            for cluster in dup_clusters:
-                cid = cluster["cluster_id"]
-                with st.expander(f"{cid} — {cluster['confidence']} ({cluster['cluster_size']} URLs)"):
-                    cluster_members = [m for m in dup_members if m["cluster_id"] == cid]
-                    st.dataframe(cluster_members, use_container_width=True)
-        st.download_button(
-            "Download Duplicate Clusters CSV",
-            data=rows_to_csv_bytes(dup_clusters),
-            file_name="vacayrank_duplicate_clusters.csv",
-            mime="text/csv",
-        )
-        st.download_button(
-            "Download Duplicate Members CSV",
-            data=rows_to_csv_bytes(dup_members),
-            file_name="vacayrank_duplicate_members.csv",
-            mime="text/csv",
-        )
-
-    if not candidates:
-        st.warning("SERP scan returned 0 candidates. Try broader queries or inspect the debug log.")
+    for category in selected_categories:
+        r = results_by_category[category]
+        title = f"{category} — Missing {len(r['missing'])} / Possible {len(r['possible'])} / Listed {len(r['listed'])}"
+        with st.expander(title, expanded=False):
+            tabs = st.tabs(["Missing", "Possible Matches", "Already Listed", "Out of Scope", "Unknown Location", "Duplicates"])
+            with tabs[0]:
+                rows = _display_candidate_rows(r["missing"])
+                st.dataframe(rows, use_container_width=True, height=320)
+                st.download_button(f"Download {category} Missing CSV", data=rows_to_csv_bytes(rows), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_missing.csv", mime="text/csv")
+            with tabs[1]:
+                rows = _display_candidate_rows(r["possible"])
+                st.dataframe(rows, use_container_width=True, height=320)
+                st.download_button(f"Download {category} Possible CSV", data=rows_to_csv_bytes(rows), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_possible.csv", mime="text/csv")
+            with tabs[2]:
+                rows = _display_candidate_rows(r["listed"])
+                st.dataframe(rows, use_container_width=True, height=320)
+                st.download_button(f"Download {category} Already CSV", data=rows_to_csv_bytes(rows), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_already.csv", mime="text/csv")
+            with tabs[3]:
+                rows = _display_candidate_rows(r["out_scope"])
+                st.dataframe(rows, use_container_width=True, height=320)
+                st.download_button(f"Download {category} Out-of-Scope CSV", data=rows_to_csv_bytes(rows), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_out_of_scope.csv", mime="text/csv")
+            with tabs[4]:
+                rows = _display_candidate_rows(r["unknown"])
+                st.dataframe(rows, use_container_width=True, height=320)
+                st.download_button(f"Download {category} Unknown CSV", data=rows_to_csv_bytes(rows), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_unknown_location.csv", mime="text/csv")
+            with tabs[5]:
+                clusters, members, scanned = r["duplicates"]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Listing pages scanned", scanned)
+                c2.metric("Clusters found", len(clusters))
+                c3.metric("Total URLs clustered", len(members))
+                if not clusters:
+                    st.info("No duplicates found for this category.")
+                else:
+                    st.dataframe(clusters, use_container_width=True, height=260)
+                    st.dataframe(members, use_container_width=True, height=260)
+                st.download_button(f"Download {category} Duplicate Clusters CSV", data=rows_to_csv_bytes(clusters), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_duplicate_clusters.csv", mime="text/csv")
+                st.download_button(f"Download {category} Duplicate Members CSV", data=rows_to_csv_bytes(members), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_duplicate_members.csv", mime="text/csv")
 
     if show_debug_log:
         st.subheader("Debug log")
