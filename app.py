@@ -25,7 +25,7 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -172,15 +172,16 @@ def _strip_ns(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
-def _swap_vailvacay_host(url: str) -> Optional[str]:
+def _alternate_host_url(url: str) -> Optional[str]:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if host == "www.vailvacay.com":
-        swapped_host = "vailvacay.com"
-    elif host == "vailvacay.com":
-        swapped_host = "www.vailvacay.com"
-    else:
+    if not host:
         return None
+
+    if host.startswith("www."):
+        swapped_host = host[4:]
+    else:
+        swapped_host = f"www.{host}"
 
     netloc = swapped_host
     if parsed.port:
@@ -188,83 +189,109 @@ def _swap_vailvacay_host(url: str) -> Optional[str]:
     return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
-def _validate_xml_response(url: str, response_text: str) -> None:
-    stripped = response_text.lstrip()
-    snippet = stripped[:200]
-    if not stripped.startswith("<"):
-        raise FetchError(f"Non-XML response for {url}: {snippet}")
+def _validate_xml_response(url: str, status_code: int, response_text: str) -> str:
+    snippet = response_text[:200]
+    if "<" not in snippet:
+        raise FetchError(f"Invalid XML payload from {url} (HTTP {status_code}). First 200 chars: {snippet}")
 
     try:
         root = ET.fromstring(response_text)
     except ET.ParseError as e:
-        raise FetchError(f"Invalid XML returned by {url}: {e}. Response starts with: {snippet}") from e
+        raise FetchError(f"Invalid XML returned by {url} (HTTP {status_code}): {e}. First 200 chars: {snippet}") from e
 
     root_tag = _strip_ns(root.tag).lower()
     if root_tag not in {"sitemapindex", "urlset"}:
-        raise FetchError(f"Unexpected XML root '{root_tag}' for {url}. Response starts with: {snippet}")
+        raise FetchError(
+            f"Unexpected XML root '{root_tag}' from {url} (HTTP {status_code}). First 200 chars: {snippet}"
+        )
+    return root_tag
 
 
-def _fetch_once(url: str, timeout_secs: int) -> str:
+def _append_debug(debug_log: Optional[List[str]], message: str) -> None:
+    if debug_log is not None:
+        debug_log.append(message)
+
+
+def _fetch_once(session: requests.Session, url: str, timeout_secs: int, debug_log: Optional[List[str]]) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
         "Accept": "application/xml,text/xml;q=0.9,text/html;q=0.8,*/*;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        "Referer": "https://www.vailvacay.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
+    retryable_statuses: Set[int] = {403, 429, 520, 521, 522, 523, 524}
 
     try:
-        resp = requests.get(url, timeout=timeout_secs, headers=headers, allow_redirects=True)
+        resp = session.get(url, timeout=timeout_secs, headers=headers, allow_redirects=True)
     except requests.RequestException as e:
+        _append_debug(debug_log, f"{url} -> request error: {e}")
         raise FetchError(f"Request failed for {url}: {e}", retryable=True) from e
 
-    if resp.status_code >= 500:
+    content_len = len(resp.content or b"")
+    _append_debug(debug_log, f"{url} -> HTTP {resp.status_code}, bytes={content_len}")
+
+    if resp.status_code >= 500 or resp.status_code in retryable_statuses:
         raise FetchError(f"HTTP {resp.status_code} for {url}", retryable=True)
     if resp.status_code >= 400:
         raise FetchError(f"HTTP {resp.status_code} for {url}")
 
     resp.encoding = resp.encoding or "utf-8"
     text = resp.text
-    _validate_xml_response(url, text)
+    root_tag = _validate_xml_response(url, resp.status_code, text)
+    _append_debug(debug_log, f"{url} -> XML root={root_tag}")
     return text
 
 
-def _retry_request(url: str, timeout_secs: int, backoffs: Tuple[float, ...]) -> str:
+def _retry_request(
+    session: requests.Session,
+    url: str,
+    timeout_secs: int,
+    max_attempts: int,
+    backoffs: Tuple[float, ...],
+    debug_log: Optional[List[str]],
+) -> str:
     last_err: Optional[FetchError] = None
-    for delay in backoffs:
-        if delay > 0:
-            time.sleep(delay)
+    for attempt in range(1, max_attempts + 1):
         try:
-            return _fetch_once(url, timeout_secs)
+            _append_debug(debug_log, f"Attempt {attempt}/{max_attempts}: {url}")
+            return _fetch_once(session, url, timeout_secs, debug_log)
         except FetchError as err:
             last_err = err
-            if not err.retryable:
+            if not err.retryable or attempt == max_attempts:
                 break
+            delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+            _append_debug(debug_log, f"Retrying {url} in {delay:.1f}s because: {err}")
+            time.sleep(delay)
     if last_err is None:
         raise FetchError(f"No request attempts were executed for {url}")
     raise last_err
 
 
-def http_get_text(url: str, timeout_secs: int) -> str:
-    backoffs = (0.0, 0.5, 1.5)
+def http_get_text(url: str, timeout_secs: int, debug_log: Optional[List[str]] = None) -> str:
+    candidate_urls = [url]
+    fallback_url = _alternate_host_url(url)
+    if fallback_url and fallback_url not in candidate_urls:
+        candidate_urls.append(fallback_url)
 
-    try:
-        return _fetch_once(url, timeout_secs)
-    except FetchError as first_err:
-        original_first_err = first_err
+    backoffs = (0.5, 1.5, 3.5)
+    max_attempts = 3
+    last_error: Optional[FetchError] = None
 
-    fallback_url = _swap_vailvacay_host(url)
-    if fallback_url:
-        try:
-            return _retry_request(fallback_url, timeout_secs, backoffs)
-        except FetchError as fallback_err:
-            if not original_first_err.retryable:
-                raise FetchError(f"{original_first_err}; fallback host failed: {fallback_err}") from fallback_err
+    with requests.Session() as session:
+        for candidate in candidate_urls:
+            try:
+                return _retry_request(session, candidate, timeout_secs, max_attempts, backoffs, debug_log)
+            except FetchError as err:
+                last_error = err
+                _append_debug(debug_log, f"Candidate failed: {candidate} -> {err}")
 
-    if original_first_err.retryable:
-        return _retry_request(url, timeout_secs, (0.5, 1.5))
-
-    raise original_first_err
+    if last_error is None:
+        raise FetchError(f"Unable to fetch sitemap from {url}")
+    raise last_error
 
 
 def parse_sitemap_index(xml_text: str) -> List[str]:
@@ -282,8 +309,8 @@ def parse_sitemap_index(xml_text: str) -> List[str]:
 
     if tag.endswith("sitemapindex"):
         sitemaps = []
-        for sm_el in root.findall("sm:sitemap", XML_NS) + root.findall("sitemap"):
-            loc_el = sm_el.find("sm:loc", XML_NS) or sm_el.find("loc")
+        for sm_el in root.findall("sm:sitemap", XML_NS):
+            loc_el = sm_el.find("sm:loc", XML_NS)
             if loc_el is not None and loc_el.text:
                 sitemaps.append(loc_el.text.strip())
 
@@ -484,11 +511,16 @@ def _fetch_inventory_uncached(
     manual_mode: bool,
     manual_index_xml: str,
     manual_child_urls_text: str,
-) -> Tuple[List[str], List[UrlRow]]:
+    debug_enabled: bool,
+) -> Tuple[List[str], List[UrlRow], List[str], Dict[str, str]]:
     """
     Fetch sitemap index, parse child sitemaps, fetch child urlsets, return (child_sitemaps, rows_unclassified).
     This function is wrapped by cache; disk-cache is handled outside.
     """
+    debug_log: List[str] = []
+    child_failures: Dict[str, str] = {}
+    active_debug_log: Optional[List[str]] = debug_log if debug_enabled else None
+
     if manual_mode:
         manual_child_sitemaps = _parse_manual_child_sitemap_urls(manual_child_urls_text)
         if manual_child_sitemaps:
@@ -500,7 +532,7 @@ def _fetch_inventory_uncached(
             if not child_sitemaps:
                 raise FetchError("Manual sitemap XML did not produce any child sitemap URLs.")
     else:
-        xml = http_get_text(sitemap_index_url, timeout_secs=timeout_secs)
+        xml = http_get_text(sitemap_index_url, timeout_secs=timeout_secs, debug_log=active_debug_log)
         child_sitemaps = parse_sitemap_index(xml)
 
         # If user gave a direct child sitemap (urlset), treat index as the only sitemap
@@ -511,14 +543,26 @@ def _fetch_inventory_uncached(
 
     rows: List[UrlRow] = []
     for sm_url in child_sitemaps:
-        sm_xml = http_get_text(sm_url, timeout_secs=timeout_secs)
+        try:
+            sm_xml = http_get_text(sm_url, timeout_secs=timeout_secs, debug_log=active_debug_log)
+            child_failures[sm_url] = "OK"
+        except FetchError as e:
+            child_failures[sm_url] = str(e)
+            _append_debug(active_debug_log, f"Child sitemap failed: {sm_url} -> {e}")
+            continue
 
         # Some "child sitemaps" are themselves sitemap indexes (nested). Support one level of nesting.
         nested = parse_sitemap_index(sm_xml)
         if nested:
             nested = nested[:max_child_sitemaps]
             for nested_url in nested:
-                nested_xml = http_get_text(nested_url, timeout_secs=timeout_secs)
+                try:
+                    nested_xml = http_get_text(nested_url, timeout_secs=timeout_secs, debug_log=active_debug_log)
+                    child_failures[nested_url] = "OK"
+                except FetchError as e:
+                    child_failures[nested_url] = str(e)
+                    _append_debug(active_debug_log, f"Nested child sitemap failed: {nested_url} -> {e}")
+                    continue
                 nested_rows = parse_urlset(nested_xml, source_sitemap_url=nested_url)
                 if max_urls_per_child > 0:
                     nested_rows = nested_rows[:max_urls_per_child]
@@ -530,7 +574,7 @@ def _fetch_inventory_uncached(
             sm_rows = sm_rows[:max_urls_per_child]
         rows.extend(sm_rows)
 
-    return child_sitemaps, rows
+    return child_sitemaps, rows, debug_log, child_failures
 
 
 def build_inventory(
@@ -544,7 +588,8 @@ def build_inventory(
     manual_mode: bool,
     manual_index_xml: str,
     manual_child_urls_text: str,
-) -> Tuple[FetchStats, List[UrlRow]]:
+    debug_enabled: bool,
+) -> Tuple[FetchStats, List[UrlRow], List[str], Dict[str, str]]:
     """
     Primary orchestration: uses disk cache unless forced, else fetches and saves to disk.
     """
@@ -566,9 +611,9 @@ def build_inventory(
                 elapsed_seconds=round(time.time() - start, 3),
                 cache_used=True,
             )
-            return stats, rows
+            return stats, rows, ["Loaded inventory from disk cache; no HTTP fetch attempts were made."], {}
 
-    child_sitemaps, rows_unclassified = _fetch_inventory_uncached(
+    child_sitemaps, rows_unclassified, debug_log, child_failures = _fetch_inventory_uncached(
         sitemap_index_url=sitemap_index_url,
         timeout_secs=timeout_secs,
         max_child_sitemaps=max_child_sitemaps,
@@ -576,6 +621,7 @@ def build_inventory(
         manual_mode=manual_mode,
         manual_index_xml=manual_index_xml,
         manual_child_urls_text=manual_child_urls_text,
+        debug_enabled=debug_enabled,
     )
 
     rows = apply_classification(rows_unclassified, classifier)
@@ -592,7 +638,7 @@ def build_inventory(
 
     if not manual_mode and rows:
         save_disk_cache(sitemap_index_url, stats, rows)
-    return stats, rows
+    return stats, rows, debug_log, child_failures
 
 
 # -----------------------------
@@ -653,6 +699,7 @@ def main() -> None:
         ).strip()
 
         manual_mode = st.checkbox("Manual XML mode (paste sitemap index XML)", value=False)
+        show_debug_log = st.checkbox("Show debug log", value=False)
         manual_index_xml = ""
         manual_child_urls_text = ""
         if manual_mode:
@@ -666,7 +713,7 @@ def main() -> None:
                 "Manual child sitemap URLs (one per line)",
                 value="",
                 height=120,
-                help="Optional: if provided, these URLs are used instead of sitemap URLs parsed from manual XML.",
+                help="Optional last-resort override: if provided, these URLs are used instead of sitemap URLs parsed from manual XML.",
             )
 
         timeout_secs = st.number_input(
@@ -769,7 +816,7 @@ def main() -> None:
     # Execution
     try:
         with st.spinner("Fetching and parsing sitemaps..."):
-            stats, rows = build_inventory(
+            stats, rows, debug_log, child_failures = build_inventory(
                 sitemap_index_url=sitemap_index_url,
                 classifier=classifier,
                 timeout_secs=int(timeout_secs),
@@ -780,11 +827,12 @@ def main() -> None:
                 manual_mode=bool(manual_mode),
                 manual_index_xml=manual_index_xml,
                 manual_child_urls_text=manual_child_urls_text,
+                debug_enabled=bool(show_debug_log),
             )
     except FetchError as e:
         st.error(f"Fetch/parse error: {e}")
         if "vailvacay.com" in sitemap_index_url.lower() or "www.vailvacay.com" in sitemap_index_url.lower():
-            st.warning("If this looks like bot/WAF blocking, enable **Manual XML mode** and paste the sitemap index XML.")
+            st.warning("If this looks like bot/WAF blocking, use **Show debug log** to inspect attempts, then use **Manual XML mode** only as a last resort.")
         st.stop()
     except Exception as e:
         st.exception(e)
@@ -795,8 +843,20 @@ def main() -> None:
     if stats.urls_found == 0:
         st.warning(
             "0 URLs were discovered. The origin may be blocking automated fetches (bot/WAF behavior). "
-            "Try **Manual XML mode** and paste sitemap XML or child sitemap URLs."
+            "See the debug diagnostics below for fetch attempts and failing child sitemap URLs."
         )
+        if child_failures:
+            failed_only = {k: v for k, v in child_failures.items() if v != "OK"}
+            if failed_only:
+                st.error("Child sitemap failures:")
+                st.json(failed_only)
+
+    if show_debug_log or stats.urls_found == 0:
+        st.subheader("Debug log")
+        if debug_log:
+            st.code("\n".join(debug_log), language="text")
+        else:
+            st.caption("No debug lines were captured for this run.")
 
     # Top stats
     st.subheader("Overview")
