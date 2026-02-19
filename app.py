@@ -1,0 +1,720 @@
+# app.py — VacayRank v1 (Milestone 1: Read-Only Inventory Engine)
+# Streamlit + Python + GitHub. Reads sitemaps, classifies URLs, shows counts, exports CSV, caches locally.
+#
+# How to run:
+#   pip install -r requirements.txt  (see suggested requirements at bottom)
+#   streamlit run app.py
+#
+# Notes:
+# - No write operations. No BD API calls in this milestone.
+# - Caching:
+#   1) Streamlit in-memory cache (st.cache_data)
+#   2) Local disk cache under ./.vacayrank_cache/
+#
+# Suggested requirements.txt:
+#   streamlit
+#   requests
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import re
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import requests
+import streamlit as st
+import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
+
+
+# -----------------------------
+# Config & Constants
+# -----------------------------
+
+APP_TITLE = "VacayRank v1 — Milestone 1 (Read-Only Inventory Engine)"
+CACHE_DIR = ".vacayrank_cache"
+DEFAULT_TIMEOUT_SECS = 20
+
+XML_NS = {
+    "sm": "http://www.sitemaps.org/schemas/sitemap/0.9",
+    # Some WP plugins add extra namespaces; we only need the sitemap core schema.
+}
+
+
+# -----------------------------
+# Data Models
+# -----------------------------
+
+@dataclass(frozen=True)
+class UrlRow:
+    url: str
+    url_type: str
+    source_sitemap: str
+    lastmod: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class FetchStats:
+    sitemap_index_url: str
+    fetched_at_utc: str
+    child_sitemaps_found: int
+    child_sitemaps_fetched: int
+    urls_found: int
+    elapsed_seconds: float
+    cache_used: bool
+
+
+# -----------------------------
+# Disk Cache Utilities
+# -----------------------------
+
+def _ensure_cache_dir() -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _stable_key(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+
+
+def _disk_cache_paths(sitemap_index_url: str) -> Tuple[str, str]:
+    """
+    Returns (json_path, csv_path) for a given sitemap index URL.
+    """
+    _ensure_cache_dir()
+    key = _stable_key(sitemap_index_url.strip())
+    return (
+        os.path.join(CACHE_DIR, f"sitemap_inventory_{key}.json"),
+        os.path.join(CACHE_DIR, f"sitemap_inventory_{key}.csv"),
+    )
+
+
+def load_disk_cache(sitemap_index_url: str, max_age_hours: float) -> Optional[Tuple[FetchStats, List[UrlRow]]]:
+    json_path, _ = _disk_cache_paths(sitemap_index_url)
+    if not os.path.exists(json_path):
+        return None
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+
+    fetched_at = payload.get("stats", {}).get("fetched_at_utc")
+    if not fetched_at:
+        return None
+
+    try:
+        fetched_dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    age_hours = (datetime.now(timezone.utc) - fetched_dt).total_seconds() / 3600.0
+    if age_hours > max_age_hours:
+        return None
+
+    try:
+        stats = FetchStats(**payload["stats"])
+        rows = [UrlRow(**r) for r in payload["rows"]]
+        return stats, rows
+    except Exception:
+        return None
+
+
+def save_disk_cache(sitemap_index_url: str, stats: FetchStats, rows: List[UrlRow]) -> None:
+    json_path, csv_path = _disk_cache_paths(sitemap_index_url)
+
+    payload = {
+        "stats": asdict(stats),
+        "rows": [asdict(r) for r in rows],
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    # Also save CSV for convenience (matches Streamlit export contents)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["url", "url_type", "source_sitemap", "lastmod"])
+        for r in rows:
+            writer.writerow([r.url, r.url_type, r.source_sitemap, r.lastmod or ""])
+
+
+def purge_disk_cache() -> int:
+    _ensure_cache_dir()
+    removed = 0
+    for name in os.listdir(CACHE_DIR):
+        if name.startswith("sitemap_inventory_") and (name.endswith(".json") or name.endswith(".csv")):
+            try:
+                os.remove(os.path.join(CACHE_DIR, name))
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+# -----------------------------
+# HTTP & XML Parsing
+# -----------------------------
+
+class FetchError(RuntimeError):
+    pass
+
+
+def http_get_text(url: str, timeout_secs: int) -> str:
+    try:
+        resp = requests.get(url, timeout=timeout_secs, headers={"User-Agent": "VacayRank/1.0 (+Streamlit)"})
+    except requests.RequestException as e:
+        raise FetchError(f"Request failed: {e}") from e
+
+    if resp.status_code >= 400:
+        raise FetchError(f"HTTP {resp.status_code} for {url}")
+
+    # requests guesses encoding; typically fine for XML. Force utf-8 fallback if unknown.
+    resp.encoding = resp.encoding or "utf-8"
+    return resp.text
+
+
+def parse_sitemap_index(xml_text: str) -> List[str]:
+    """
+    Parses a sitemap index and returns child sitemap URLs.
+    Supports both <sitemapindex> and a plain <urlset> (in case user points directly to a child sitemap).
+    """
+    xml_text = xml_text.strip()
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise FetchError(f"Invalid XML: {e}") from e
+
+    tag = _strip_ns(root.tag).lower()
+
+    if tag.endswith("sitemapindex"):
+        sitemaps = []
+        for sm_el in root.findall("sm:sitemap", XML_NS) + root.findall("sitemap"):
+            loc_el = sm_el.find("sm:loc", XML_NS) or sm_el.find("loc")
+            if loc_el is not None and loc_el.text:
+                sitemaps.append(loc_el.text.strip())
+        return dedupe_preserve_order(sitemaps)
+
+    # If it's a urlset, treat it as a "single sitemap" input (no children)
+    if tag.endswith("urlset"):
+        return []
+
+    # Fallback: try loc elements generically
+    locs = []
+    for loc_el in root.findall(".//sm:loc", XML_NS) + root.findall(".//loc"):
+        if loc_el is not None and loc_el.text:
+            locs.append(loc_el.text.strip())
+    return dedupe_preserve_order(locs)
+
+
+def parse_urlset(xml_text: str, source_sitemap_url: str) -> List[UrlRow]:
+    """
+    Parses a child sitemap <urlset> and returns UrlRow list (url, lastmod).
+    """
+    xml_text = xml_text.strip()
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise FetchError(f"Invalid XML in child sitemap: {e}") from e
+
+    tag = _strip_ns(root.tag).lower()
+    if not tag.endswith("urlset"):
+        # Some sites nest indexes; if so, parse as index and return rows empty here.
+        return []
+
+    rows: List[UrlRow] = []
+    for url_el in root.findall("sm:url", XML_NS) + root.findall("url"):
+        loc_el = url_el.find("sm:loc", XML_NS) or url_el.find("loc")
+        if loc_el is None or not loc_el.text:
+            continue
+        loc = loc_el.text.strip()
+
+        lastmod_el = url_el.find("sm:lastmod", XML_NS) or url_el.find("lastmod")
+        lastmod = lastmod_el.text.strip() if (lastmod_el is not None and lastmod_el.text) else None
+
+        rows.append(UrlRow(url=loc, url_type="unclassified", source_sitemap=source_sitemap_url, lastmod=lastmod))
+
+    return rows
+
+
+def _strip_ns(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+# -----------------------------
+# URL Classification
+# -----------------------------
+
+@dataclass(frozen=True)
+class ClassifierConfig:
+    # Path regexes; evaluated in order.
+    profile_patterns: Tuple[str, ...]
+    blog_patterns: Tuple[str, ...]
+    category_patterns: Tuple[str, ...]
+    search_patterns: Tuple[str, ...]
+    static_patterns: Tuple[str, ...]
+
+
+DEFAULT_CLASSIFIER = ClassifierConfig(
+    profile_patterns=(
+        r"^/hotels?(/|$)",
+        r"^/lodging(/|$)",
+        r"^/stay(/|$)",
+        r"^/restaurant(s)?(/|$)",
+        r"^/dining(/|$)",
+        r"^/activities?(/|$)",
+        r"^/things-to-do(/|$)",
+        r"^/shops?(/|$)",
+        r"^/vacation-rentals?(/|$)",
+    ),
+    blog_patterns=(
+        r"^/blog(/|$)",
+        r"^/posts?(/|$)",
+        r"^/news(/|$)",
+        r"^/\d{4}/\d{2}/\d{2}/",  # WP style
+    ),
+    category_patterns=(
+        r"^/category(/|$)",
+        r"^/tag(/|$)",
+        r"^/topics?(/|$)",
+        r"^/categories(/|$)",
+    ),
+    search_patterns=(
+        r"^/search(/|$)",
+        r"^/\?s=",
+        r"^/(\w+/)?\?q=",
+    ),
+    static_patterns=(
+        r"^/$",
+        r"^/about(/|$)",
+        r"^/contact(/|$)",
+        r"^/privacy(-policy)?(/|$)",
+        r"^/terms(-of-service)?(/|$)",
+        r"^/sitemap(_index)?\.xml$",
+        r"^/robots\.txt$",
+    ),
+)
+
+
+def classify_url(url: str, cfg: ClassifierConfig) -> str:
+    """
+    Classify a URL into one of:
+      profiles, blog_posts, categories, static, search, other
+    """
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        query = parsed.query or ""
+        combined_for_search = path + ("?" + query if query else "")
+    except Exception:
+        # If parsing fails, do best-effort string checks
+        path = url
+        combined_for_search = url
+
+    def _matches_any(patterns: Tuple[str, ...], target: str) -> bool:
+        for pat in patterns:
+            if re.search(pat, target, flags=re.IGNORECASE):
+                return True
+        return False
+
+    if _matches_any(cfg.search_patterns, combined_for_search):
+        return "search"
+
+    if _matches_any(cfg.static_patterns, path):
+        return "static"
+
+    if _matches_any(cfg.category_patterns, path):
+        return "categories"
+
+    if _matches_any(cfg.blog_patterns, path):
+        return "blog_posts"
+
+    if _matches_any(cfg.profile_patterns, path):
+        return "profiles"
+
+    return "other"
+
+
+def apply_classification(rows: List[UrlRow], cfg: ClassifierConfig) -> List[UrlRow]:
+    out: List[UrlRow] = []
+    for r in rows:
+        out.append(
+            UrlRow(
+                url=r.url,
+                url_type=classify_url(r.url, cfg),
+                source_sitemap=r.source_sitemap,
+                lastmod=r.lastmod,
+            )
+        )
+    return out
+
+
+# -----------------------------
+# Inventory Engine
+# -----------------------------
+
+@st.cache_data(show_spinner=False)
+def _fetch_inventory_uncached(
+    sitemap_index_url: str,
+    timeout_secs: int,
+    max_child_sitemaps: int,
+    max_urls_per_child: int,
+) -> Tuple[List[str], List[UrlRow]]:
+    """
+    Fetch sitemap index, parse child sitemaps, fetch child urlsets, return (child_sitemaps, rows_unclassified).
+    This function is wrapped by cache; disk-cache is handled outside.
+    """
+    xml = http_get_text(sitemap_index_url, timeout_secs=timeout_secs)
+    child_sitemaps = parse_sitemap_index(xml)
+
+    # If user gave a direct child sitemap (urlset), treat index as the only sitemap
+    if not child_sitemaps:
+        child_sitemaps = [sitemap_index_url]
+
+    child_sitemaps = child_sitemaps[:max_child_sitemaps]
+
+    rows: List[UrlRow] = []
+    for sm_url in child_sitemaps:
+        sm_xml = http_get_text(sm_url, timeout_secs=timeout_secs)
+
+        # Some "child sitemaps" are themselves sitemap indexes (nested). Support one level of nesting.
+        nested = parse_sitemap_index(sm_xml)
+        if nested:
+            nested = nested[:max_child_sitemaps]
+            for nested_url in nested:
+                nested_xml = http_get_text(nested_url, timeout_secs=timeout_secs)
+                nested_rows = parse_urlset(nested_xml, source_sitemap_url=nested_url)
+                if max_urls_per_child > 0:
+                    nested_rows = nested_rows[:max_urls_per_child]
+                rows.extend(nested_rows)
+            continue
+
+        sm_rows = parse_urlset(sm_xml, source_sitemap_url=sm_url)
+        if max_urls_per_child > 0:
+            sm_rows = sm_rows[:max_urls_per_child]
+        rows.extend(sm_rows)
+
+    return child_sitemaps, rows
+
+
+def build_inventory(
+    sitemap_index_url: str,
+    classifier: ClassifierConfig,
+    timeout_secs: int,
+    max_child_sitemaps: int,
+    max_urls_per_child: int,
+    disk_cache_max_age_hours: float,
+    force_refresh: bool,
+) -> Tuple[FetchStats, List[UrlRow]]:
+    """
+    Primary orchestration: uses disk cache unless forced, else fetches and saves to disk.
+    """
+    start = time.time()
+
+    if not force_refresh:
+        disk = load_disk_cache(sitemap_index_url, max_age_hours=disk_cache_max_age_hours)
+        if disk is not None:
+            stats, rows = disk
+            # Re-classify with current patterns (so changes in patterns update without re-fetch)
+            rows = apply_classification(rows, classifier)
+            stats = FetchStats(
+                sitemap_index_url=stats.sitemap_index_url,
+                fetched_at_utc=stats.fetched_at_utc,
+                child_sitemaps_found=stats.child_sitemaps_found,
+                child_sitemaps_fetched=stats.child_sitemaps_fetched,
+                urls_found=stats.urls_found,
+                elapsed_seconds=round(time.time() - start, 3),
+                cache_used=True,
+            )
+            return stats, rows
+
+    child_sitemaps, rows_unclassified = _fetch_inventory_uncached(
+        sitemap_index_url=sitemap_index_url,
+        timeout_secs=timeout_secs,
+        max_child_sitemaps=max_child_sitemaps,
+        max_urls_per_child=max_urls_per_child,
+    )
+
+    rows = apply_classification(rows_unclassified, classifier)
+
+    stats = FetchStats(
+        sitemap_index_url=sitemap_index_url,
+        fetched_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        child_sitemaps_found=len(child_sitemaps),
+        child_sitemaps_fetched=len(child_sitemaps),
+        urls_found=len(rows),
+        elapsed_seconds=round(time.time() - start, 3),
+        cache_used=False,
+    )
+
+    save_disk_cache(sitemap_index_url, stats, rows)
+    return stats, rows
+
+
+# -----------------------------
+# CSV Export Helpers
+# -----------------------------
+
+def rows_to_csv_bytes(rows: List[UrlRow]) -> bytes:
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["url", "url_type", "source_sitemap", "lastmod"])
+    for r in rows:
+        writer.writerow([r.url, r.url_type, r.source_sitemap, r.lastmod or ""])
+    return buf.getvalue().encode("utf-8")
+
+
+def summarize_counts(rows: List[UrlRow]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[r.url_type] = counts.get(r.url_type, 0) + 1
+    # ensure stable keys even if empty
+    for k in ("profiles", "blog_posts", "categories", "static", "search", "other"):
+        counts.setdefault(k, 0)
+    return counts
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+def _patterns_editor(title: str, patterns: Tuple[str, ...], help_text: str) -> Tuple[str, ...]:
+    st.caption(help_text)
+    text = st.text_area(title, value="\n".join(patterns), height=140)
+    cleaned = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        cleaned.append(line)
+    return tuple(cleaned)
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+    st.write(
+        "This milestone reads your sitemap(s), classifies URLs, shows inventory counts, and exports CSV. "
+        "It performs **no write operations**."
+    )
+
+    with st.sidebar:
+        st.header("Settings")
+
+        sitemap_index_url = st.text_input(
+            "Sitemap index URL",
+            value="https://vailvacay.com/sitemap_index.xml",
+            help="Point to your sitemap index. If you paste a single child sitemap (urlset), it still works.",
+        ).strip()
+
+        timeout_secs = st.number_input(
+            "HTTP timeout (seconds)",
+            min_value=5,
+            max_value=60,
+            value=DEFAULT_TIMEOUT_SECS,
+            step=1,
+        )
+
+        max_child_sitemaps = st.number_input(
+            "Max child sitemaps to fetch",
+            min_value=1,
+            max_value=5000,
+            value=200,
+            step=10,
+            help="Safety limit. Increase if your sitemap index is large.",
+        )
+
+        max_urls_per_child = st.number_input(
+            "Max URLs per child sitemap (0 = no limit)",
+            min_value=0,
+            max_value=500000,
+            value=0,
+            step=1000,
+            help="Safety limit for very large sitemaps. Use 0 to fetch all URLs.",
+        )
+
+        st.divider()
+        st.subheader("Local disk cache")
+        disk_cache_max_age_hours = st.number_input(
+            "Use disk cache if newer than (hours)",
+            min_value=0.0,
+            max_value=720.0,
+            value=12.0,
+            step=1.0,
+            help="If a cached run exists on disk newer than this age, it will load instantly.",
+        )
+
+        colA, colB = st.columns(2)
+        with colA:
+            force_refresh = st.checkbox("Force refresh (ignore disk cache)", value=False)
+        with colB:
+            if st.button("Purge disk cache"):
+                removed = purge_disk_cache()
+                st.success(f"Removed {removed} cached file(s).")
+
+        st.divider()
+        st.subheader("Classification patterns")
+        st.caption(
+            "Patterns are evaluated in this order: **search → static → categories → blog_posts → profiles → other**. "
+            "Regex is supported."
+        )
+
+        profiles = _patterns_editor(
+            "Profiles patterns (regex, one per line)",
+            DEFAULT_CLASSIFIER.profile_patterns,
+            "Example: /hotels, /restaurants, /activities",
+        )
+        blog_posts = _patterns_editor(
+            "Blog patterns (regex, one per line)",
+            DEFAULT_CLASSIFIER.blog_patterns,
+            "Example: /blog or WordPress /YYYY/MM/DD/",
+        )
+        categories = _patterns_editor(
+            "Category patterns (regex, one per line)",
+            DEFAULT_CLASSIFIER.category_patterns,
+            "Example: /category, /tag",
+        )
+        search = _patterns_editor(
+            "Search patterns (regex, one per line)",
+            DEFAULT_CLASSIFIER.search_patterns,
+            "Example: /search or ?s= query strings",
+        )
+        static = _patterns_editor(
+            "Static patterns (regex, one per line)",
+            DEFAULT_CLASSIFIER.static_patterns,
+            "Example: /about, /contact, /privacy-policy, /",
+        )
+
+        classifier = ClassifierConfig(
+            profile_patterns=profiles,
+            blog_patterns=blog_posts,
+            category_patterns=categories,
+            search_patterns=search,
+            static_patterns=static,
+        )
+
+        st.divider()
+        run = st.button("Run inventory scan", type="primary")
+
+    if not sitemap_index_url:
+        st.warning("Enter a sitemap index URL to begin.")
+        return
+
+    if not run:
+        st.info("Configure settings on the left, then click **Run inventory scan**.")
+        return
+
+    # Execution
+    try:
+        with st.spinner("Fetching and parsing sitemaps..."):
+            stats, rows = build_inventory(
+                sitemap_index_url=sitemap_index_url,
+                classifier=classifier,
+                timeout_secs=int(timeout_secs),
+                max_child_sitemaps=int(max_child_sitemaps),
+                max_urls_per_child=int(max_urls_per_child),
+                disk_cache_max_age_hours=float(disk_cache_max_age_hours),
+                force_refresh=bool(force_refresh),
+            )
+    except FetchError as e:
+        st.error(f"Fetch/parse error: {e}")
+        st.stop()
+    except Exception as e:
+        st.exception(e)
+        st.stop()
+
+    counts = summarize_counts(rows)
+
+    # Top stats
+    st.subheader("Overview")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Profiles", counts["profiles"])
+    c2.metric("Blog posts", counts["blog_posts"])
+    c3.metric("Categories", counts["categories"])
+    c4.metric("Static", counts["static"])
+    c5.metric("Search", counts["search"])
+    c6.metric("Other", counts["other"])
+
+    st.caption(
+        f"Sitemap: {stats.sitemap_index_url}  •  "
+        f"Fetched at (UTC): {stats.fetched_at_utc}  •  "
+        f"Child sitemaps fetched: {stats.child_sitemaps_fetched}  •  "
+        f"URLs found: {stats.urls_found}  •  "
+        f"Elapsed: {stats.elapsed_seconds}s  •  "
+        f"Disk cache used: {'Yes' if stats.cache_used else 'No'}"
+    )
+
+    # Download export
+    st.subheader("Export")
+    csv_bytes = rows_to_csv_bytes(rows)
+    st.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name="vacayrank_inventory.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # Child sitemap list + details
+    st.subheader("Details")
+    tab1, tab2, tab3 = st.tabs(["URL Table", "By Type", "Cache Files"])
+
+    with tab1:
+        st.caption("All discovered URLs (classified). Use the table filters/sort.")
+        st.dataframe(
+            [{"url": r.url, "url_type": r.url_type, "source_sitemap": r.source_sitemap, "lastmod": r.lastmod} for r in rows],
+            use_container_width=True,
+            height=520,
+        )
+
+    with tab2:
+        left, right = st.columns([1, 2])
+        with left:
+            st.caption("Counts by type")
+            st.json(counts)
+        with right:
+            selected = st.selectbox("Show URLs for type", options=["profiles", "blog_posts", "categories", "static", "search", "other"])
+            subset = [r for r in rows if r.url_type == selected]
+            st.write(f"Found **{len(subset)}** URLs for **{selected}**.")
+            st.dataframe(
+                [{"url": r.url, "source_sitemap": r.source_sitemap, "lastmod": r.lastmod} for r in subset],
+                use_container_width=True,
+                height=520,
+            )
+
+    with tab3:
+        _ensure_cache_dir()
+        json_path, csv_path = _disk_cache_paths(sitemap_index_url)
+        st.write("Disk cache locations for this sitemap index URL:")
+        st.code(json_path)
+        st.code(csv_path)
+        st.caption("Tip: Commit **nothing** from .vacayrank_cache to GitHub (add to .gitignore).")
+
+    # Lightweight recommendation block (non-placeholder, actionable)
+    st.subheader("Next Step (Milestone 2 preview)")
+    st.write(
+        "Once inventory is stable, the next milestone typically adds **diffing** (today vs prior run), "
+        "**per-type sampling/validation**, and **BD API mapping** (read-only) so we can prepare safe write operations later."
+    )
+
+
+if __name__ == "__main__":
+    main()
