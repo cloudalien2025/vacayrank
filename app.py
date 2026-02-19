@@ -1,24 +1,8 @@
-# app.py — VacayRank v1 (Milestone 1: Read-Only Inventory Engine)
-# Streamlit + Python + GitHub. Reads sitemaps, classifies URLs, shows counts, exports CSV, caches locally.
-#
-# How to run:
-#   pip install -r requirements.txt  (see suggested requirements at bottom)
-#   streamlit run app.py
-#
-# Notes:
-# - No write operations. No BD API calls in this milestone.
-# - Caching:
-#   1) Streamlit in-memory cache (st.cache_data)
-#   2) Local disk cache under ./vacayrank_cache/
-#
-# Suggested requirements.txt:
-#   streamlit
-#   requests
-
 from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -33,23 +17,51 @@ import streamlit as st
 import xml.etree.ElementTree as ET
 
 
-# -----------------------------
-# Config & Constants
-# -----------------------------
-
-APP_TITLE = "VacayRank v1 — Milestone 1 (Read-Only Inventory Engine)"
+APP_TITLE = "VacayRank v1 — Inventory + SERP Gap Engine"
 CACHE_DIR = "vacayrank_cache"
 DEFAULT_TIMEOUT_SECS = 20
+SERP_API_URL = "https://serpapi.com/search.json"
 
-XML_NS = {
-    "sm": "http://www.sitemaps.org/schemas/sitemap/0.9",
-    # Some WP plugins add extra namespaces; we only need the sitemap core schema.
+XML_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+CATEGORY_QUERY_TEMPLATES = {
+    "Hotels": [
+        "hotels in {destination} {region}",
+        "best hotels in {destination} {region}",
+        "luxury hotels in {destination} {region}",
+        "ski resort hotels in {destination} {region}",
+        "{destination} {region} lodging",
+    ],
+    "Restaurants": [
+        "restaurants in {destination} {region}",
+        "best restaurants in {destination} {region}",
+        "fine dining in {destination} {region}",
+        "breakfast in {destination} {region}",
+        "{destination} {region} dinner",
+    ],
+    "Activities": [
+        "things to do in {destination} {region}",
+        "best activities in {destination} {region}",
+        "tours in {destination} {region}",
+        "{destination} {region} attractions",
+        "outdoor activities in {destination} {region}",
+    ],
+    "Nightlife": [
+        "nightlife in {destination} {region}",
+        "bars in {destination} {region}",
+        "live music in {destination} {region}",
+        "cocktail bars in {destination} {region}",
+        "clubs in {destination} {region}",
+    ],
+    "Shopping": [
+        "shopping in {destination} {region}",
+        "best shops in {destination} {region}",
+        "boutiques in {destination} {region}",
+        "souvenir stores in {destination} {region}",
+        "outlet stores in {destination} {region}",
+    ],
 }
 
-
-# -----------------------------
-# Data Models
-# -----------------------------
 
 @dataclass(frozen=True)
 class UrlRow:
@@ -70,9 +82,19 @@ class FetchStats:
     cache_used: bool
 
 
-# -----------------------------
-# Disk Cache Utilities
-# -----------------------------
+@dataclass(frozen=True)
+class InventoryEntity:
+    url: str
+    domain: str
+    derived_name: str
+    normalized_name: str
+
+
+class FetchError(RuntimeError):
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
 
 def _ensure_cache_dir() -> None:
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -82,129 +104,8 @@ def _stable_key(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
 
 
-def _disk_cache_paths(sitemap_index_url: str) -> Tuple[str, str]:
-    """
-    Returns (json_path, csv_path) for a given sitemap index URL.
-    """
-    _ensure_cache_dir()
-    key = _stable_key(sitemap_index_url.strip())
-    return (
-        os.path.join(CACHE_DIR, f"sitemap_inventory_{key}.json"),
-        os.path.join(CACHE_DIR, f"sitemap_inventory_{key}.csv"),
-    )
-
-
-def load_disk_cache(sitemap_index_url: str, max_age_hours: float) -> Optional[Tuple[FetchStats, List[UrlRow]]]:
-    json_path, _ = _disk_cache_paths(sitemap_index_url)
-    if not os.path.exists(json_path):
-        return None
-
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception:
-        return None
-
-    fetched_at = payload.get("stats", {}).get("fetched_at_utc")
-    if not fetched_at:
-        return None
-
-    try:
-        fetched_dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-    age_hours = (datetime.now(timezone.utc) - fetched_dt).total_seconds() / 3600.0
-    if age_hours > max_age_hours:
-        return None
-
-    try:
-        stats = FetchStats(**payload["stats"])
-        rows = [UrlRow(**r) for r in payload["rows"]]
-        return stats, rows
-    except Exception:
-        return None
-
-
-def save_disk_cache(sitemap_index_url: str, stats: FetchStats, rows: List[UrlRow]) -> None:
-    json_path, csv_path = _disk_cache_paths(sitemap_index_url)
-
-    payload = {
-        "stats": asdict(stats),
-        "rows": [asdict(r) for r in rows],
-    }
-
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    # Also save CSV for convenience (matches Streamlit export contents)
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["url", "url_type", "source_sitemap", "lastmod"])
-        for r in rows:
-            writer.writerow([r.url, r.url_type, r.source_sitemap, r.lastmod or ""])
-
-
-def purge_disk_cache() -> int:
-    _ensure_cache_dir()
-    removed = 0
-    for name in os.listdir(CACHE_DIR):
-        if name.startswith("sitemap_inventory_") and (name.endswith(".json") or name.endswith(".csv")):
-            try:
-                os.remove(os.path.join(CACHE_DIR, name))
-                removed += 1
-            except Exception:
-                pass
-    return removed
-
-
-# -----------------------------
-# HTTP & XML Parsing
-# -----------------------------
-
-class FetchError(RuntimeError):
-    def __init__(self, message: str, retryable: bool = False):
-        super().__init__(message)
-        self.retryable = retryable
-
-
 def _strip_ns(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
-
-
-def _alternate_host_url(url: str) -> Optional[str]:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return None
-
-    if host.startswith("www."):
-        swapped_host = host[4:]
-    else:
-        swapped_host = f"www.{host}"
-
-    netloc = swapped_host
-    if parsed.port:
-        netloc = f"{swapped_host}:{parsed.port}"
-    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
-
-
-def _validate_xml_response(url: str, status_code: int, response_text: str) -> str:
-    snippet = response_text[:200]
-    if "<" not in snippet:
-        raise FetchError(f"Invalid XML payload from {url} (HTTP {status_code}). First 200 chars: {snippet}")
-
-    try:
-        root = ET.fromstring(response_text)
-    except ET.ParseError as e:
-        raise FetchError(f"Invalid XML returned by {url} (HTTP {status_code}): {e}. First 200 chars: {snippet}") from e
-
-    root_tag = _strip_ns(root.tag).lower()
-    if root_tag not in {"sitemapindex", "urlset"}:
-        raise FetchError(
-            f"Unexpected XML root '{root_tag}' from {url} (HTTP {status_code}). First 200 chars: {snippet}"
-        )
-    return root_tag
 
 
 def _append_debug(debug_log: Optional[List[str]], message: str) -> None:
@@ -212,28 +113,55 @@ def _append_debug(debug_log: Optional[List[str]], message: str) -> None:
         debug_log.append(message)
 
 
+def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _alternate_host_url(url: str) -> Optional[str]:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+    swapped_host = host[4:] if host.startswith("www.") else f"www.{host}"
+    netloc = f"{swapped_host}:{parsed.port}" if parsed.port else swapped_host
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
+def _validate_xml_response(url: str, status_code: int, response_text: str) -> str:
+    snippet = response_text[:200]
+    if "<" not in snippet:
+        raise FetchError(f"Invalid XML payload from {url} (HTTP {status_code}). First 200 chars: {snippet}")
+    try:
+        root = ET.fromstring(response_text)
+    except ET.ParseError as e:
+        raise FetchError(f"Invalid XML returned by {url} (HTTP {status_code}): {e}. First 200 chars: {snippet}") from e
+    root_tag = _strip_ns(root.tag).lower()
+    if root_tag not in {"sitemapindex", "urlset"}:
+        raise FetchError(f"Unexpected XML root '{root_tag}' from {url} (HTTP {status_code}). First 200 chars: {snippet}")
+    return root_tag
+
+
 def _fetch_once(session: requests.Session, url: str, timeout_secs: int, debug_log: Optional[List[str]]) -> str:
+    retryable_statuses = {403, 429, 520, 521, 522, 523, 524}
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0",
         "Accept": "application/xml,text/xml;q=0.9,text/html;q=0.8,*/*;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Referer": "https://www.vailvacay.com/",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     }
-    retryable_statuses: Set[int] = {403, 429, 520, 521, 522, 523, 524}
-
     try:
         resp = session.get(url, timeout=timeout_secs, headers=headers, allow_redirects=True)
     except requests.RequestException as e:
         _append_debug(debug_log, f"{url} -> request error: {e}")
         raise FetchError(f"Request failed for {url}: {e}", retryable=True) from e
 
-    content_len = len(resp.content or b"")
-    _append_debug(debug_log, f"{url} -> HTTP {resp.status_code}, bytes={content_len}")
-
+    _append_debug(debug_log, f"{url} -> HTTP {resp.status_code}, bytes={len(resp.content or b'')}")
     if resp.status_code >= 500 or resp.status_code in retryable_statuses:
         raise FetchError(f"HTTP {resp.status_code} for {url}", retryable=True)
     if resp.status_code >= 400:
@@ -241,30 +169,23 @@ def _fetch_once(session: requests.Session, url: str, timeout_secs: int, debug_lo
 
     resp.encoding = resp.encoding or "utf-8"
     text = resp.text
-    root_tag = _validate_xml_response(url, resp.status_code, text)
-    _append_debug(debug_log, f"{url} -> XML root={root_tag}")
+    _validate_xml_response(url, resp.status_code, text)
     return text
 
 
-def _retry_request(
-    session: requests.Session,
-    url: str,
-    timeout_secs: int,
-    max_attempts: int,
-    backoffs: Tuple[float, ...],
-    debug_log: Optional[List[str]],
-) -> str:
+def _retry_request(session: requests.Session, url: str, timeout_secs: int, debug_log: Optional[List[str]]) -> str:
+    backoffs = (0.5, 1.5, 3.5)
     last_err: Optional[FetchError] = None
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, 4):
         try:
-            _append_debug(debug_log, f"Attempt {attempt}/{max_attempts}: {url}")
+            _append_debug(debug_log, f"Attempt {attempt}/3: {url}")
             return _fetch_once(session, url, timeout_secs, debug_log)
         except FetchError as err:
             last_err = err
-            if not err.retryable or attempt == max_attempts:
+            if not err.retryable or attempt == 3:
                 break
             delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
-            _append_debug(debug_log, f"Retrying {url} in {delay:.1f}s because: {err}")
+            _append_debug(debug_log, f"Retrying in {delay:.1f}s due to: {err}")
             time.sleep(delay)
     if last_err is None:
         raise FetchError(f"No request attempts were executed for {url}")
@@ -272,134 +193,74 @@ def _retry_request(
 
 
 def http_get_text(url: str, timeout_secs: int, debug_log: Optional[List[str]] = None) -> str:
-    candidate_urls = [url]
-    fallback_url = _alternate_host_url(url)
-    if fallback_url and fallback_url not in candidate_urls:
-        candidate_urls.append(fallback_url)
-
-    backoffs = (0.5, 1.5, 3.5)
-    max_attempts = 3
-    last_error: Optional[FetchError] = None
-
+    candidates = [url]
+    fallback = _alternate_host_url(url)
+    if fallback and fallback not in candidates:
+        candidates.append(fallback)
     with requests.Session() as session:
-        for candidate in candidate_urls:
+        last_error: Optional[FetchError] = None
+        for candidate in candidates:
             try:
-                return _retry_request(session, candidate, timeout_secs, max_attempts, backoffs, debug_log)
-            except FetchError as err:
-                last_error = err
-                _append_debug(debug_log, f"Candidate failed: {candidate} -> {err}")
-
-    if last_error is None:
-        raise FetchError(f"Unable to fetch sitemap from {url}")
-    raise last_error
+                return _retry_request(session, candidate, timeout_secs, debug_log)
+            except FetchError as e:
+                last_error = e
+                _append_debug(debug_log, f"Candidate failed: {candidate} -> {e}")
+        if last_error:
+            raise last_error
+    raise FetchError(f"Unable to fetch sitemap from {url}")
 
 
 def parse_sitemap_index(xml_text: str) -> List[str]:
-    """
-    Parses a sitemap index and returns child sitemap URLs.
-    Supports both <sitemapindex> and a plain <urlset> (in case user points directly to a child sitemap).
-    """
-    xml_text = xml_text.strip()
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(xml_text.strip())
     except ET.ParseError as e:
         raise FetchError(f"Invalid XML: {e}") from e
 
     tag = _strip_ns(root.tag).lower()
-
     if tag.endswith("sitemapindex"):
         sitemaps = []
         for sm_el in root.findall("sm:sitemap", XML_NS):
             loc_el = sm_el.find("sm:loc", XML_NS)
             if loc_el is not None and loc_el.text:
                 sitemaps.append(loc_el.text.strip())
-
         if not sitemaps:
             for sm_el in root.iter():
-                if _strip_ns(sm_el.tag).lower() != "sitemap":
-                    continue
-                for child in sm_el:
-                    if _strip_ns(child.tag).lower() == "loc" and child.text:
-                        sitemaps.append(child.text.strip())
-                        break
-
+                if _strip_ns(sm_el.tag).lower() == "loc" and sm_el.text:
+                    sitemaps.append(sm_el.text.strip())
         if not sitemaps:
-            raise FetchError("Sitemap index parsed but contained 0 child sitemaps (loc entries).")
-
+            raise FetchError("Sitemap index parsed but contained 0 child sitemaps.")
         return dedupe_preserve_order(sitemaps)
-
-    # If it's a urlset, treat it as a "single sitemap" input (no children)
     if tag.endswith("urlset"):
         return []
-
-    # Fallback: try loc elements generically
-    locs = []
-    for loc_el in root.findall(".//sm:loc", XML_NS) + root.findall(".//loc"):
-        if loc_el is not None and loc_el.text:
-            locs.append(loc_el.text.strip())
-    return dedupe_preserve_order(locs)
+    return []
 
 
 def parse_urlset(xml_text: str, source_sitemap_url: str) -> List[UrlRow]:
-    """
-    Parses a child sitemap <urlset> and returns UrlRow list (url, lastmod).
-    """
-    xml_text = xml_text.strip()
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(xml_text.strip())
     except ET.ParseError as e:
         raise FetchError(f"Invalid XML in child sitemap: {e}") from e
-
-    root_localname = _strip_ns(root.tag).lower()
-    if root_localname != "urlset":
-        # Some sites nest indexes; if so, parse as index and return rows empty here.
+    if _strip_ns(root.tag).lower() != "urlset":
         return []
 
     rows: List[UrlRow] = []
     for el in root.iter():
         if _strip_ns(el.tag).lower() != "url":
             continue
-
-        loc: Optional[str] = None
-        lastmod: Optional[str] = None
+        loc, lastmod = None, None
         for child in el:
-            child_localname = _strip_ns(child.tag).lower()
-            if child_localname == "loc" and child.text and not loc:
+            cname = _strip_ns(child.tag).lower()
+            if cname == "loc" and child.text and not loc:
                 loc = child.text.strip()
-            elif child_localname == "lastmod" and child.text and not lastmod:
+            elif cname == "lastmod" and child.text and not lastmod:
                 lastmod = child.text.strip()
-
-        if not loc:
-            continue
-
-        rows.append(UrlRow(url=loc, url_type="unclassified", source_sitemap=source_sitemap_url, lastmod=lastmod))
-
+        if loc:
+            rows.append(UrlRow(url=loc, url_type="unclassified", source_sitemap=source_sitemap_url, lastmod=lastmod))
     return rows
 
 
-def _xml_root_localname(xml_text: str) -> str:
-    root = ET.fromstring(xml_text.strip())
-    return _strip_ns(root.tag).lower()
-
-
-def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in items:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-
-# -----------------------------
-# URL Classification
-# -----------------------------
-
 @dataclass(frozen=True)
 class ClassifierConfig:
-    # Path regexes; evaluated in order.
     profile_patterns: Tuple[str, ...]
     blog_patterns: Tuple[str, ...]
     category_patterns: Tuple[str, ...]
@@ -408,256 +269,126 @@ class ClassifierConfig:
 
 
 DEFAULT_CLASSIFIER = ClassifierConfig(
-    profile_patterns=(
-        r"^/hotels?(/|$)",
-        r"^/lodging(/|$)",
-        r"^/stay(/|$)",
-        r"^/restaurant(s)?(/|$)",
-        r"^/dining(/|$)",
-        r"^/activities?(/|$)",
-        r"^/things-to-do(/|$)",
-        r"^/shops?(/|$)",
-        r"^/vacation-rentals?(/|$)",
-    ),
-    blog_patterns=(
-        r"^/blog(/|$)",
-        r"^/posts?(/|$)",
-        r"^/news(/|$)",
-        r"^/\d{4}/\d{2}/\d{2}/",  # WP style
-    ),
-    category_patterns=(
-        r"^/category(/|$)",
-        r"^/tag(/|$)",
-        r"^/topics?(/|$)",
-        r"^/categories(/|$)",
-    ),
-    search_patterns=(
-        r"^/search(/|$)",
-        r"^/\?s=",
-        r"^/(\w+/)?\?q=",
-    ),
-    static_patterns=(
-        r"^/$",
-        r"^/about(/|$)",
-        r"^/contact(/|$)",
-        r"^/privacy(-policy)?(/|$)",
-        r"^/terms(-of-service)?(/|$)",
-        r"^/sitemap(_index)?\.xml$",
-        r"^/robots\.txt$",
-    ),
+    profile_patterns=(r"^/hotels?(/|$)", r"^/lodging(/|$)", r"^/stay(/|$)", r"^/restaurant(s)?(/|$)", r"^/dining(/|$)", r"^/activities?(/|$)", r"^/things-to-do(/|$)", r"^/shops?(/|$)", r"^/vacation-rentals?(/|$)"),
+    blog_patterns=(r"^/blog(/|$)", r"^/posts?(/|$)", r"^/news(/|$)", r"^/\d{4}/\d{2}/\d{2}/"),
+    category_patterns=(r"^/category(/|$)", r"^/tag(/|$)", r"^/topics?(/|$)", r"^/categories(/|$)"),
+    search_patterns=(r"^/search(/|$)", r"^/\?s=", r"^/(\w+/)?\?q="),
+    static_patterns=(r"^/$", r"^/about(/|$)", r"^/contact(/|$)", r"^/privacy(-policy)?(/|$)", r"^/terms(-of-service)?(/|$)"),
 )
 
 
 def classify_url(url: str, cfg: ClassifierConfig) -> str:
-    """
-    Classify a URL into one of:
-      profiles, blog_posts, categories, static, search, other
-    """
     try:
         parsed = urlparse(url)
         path = parsed.path or "/"
-        query = parsed.query or ""
-        combined_for_search = path + ("?" + query if query else "")
+        combined = path + ("?" + parsed.query if parsed.query else "")
     except Exception:
-        # If parsing fails, do best-effort string checks
-        path = url
-        combined_for_search = url
+        path, combined = url, url
 
-    def _matches_any(patterns: Tuple[str, ...], target: str) -> bool:
-        for pat in patterns:
-            if re.search(pat, target, flags=re.IGNORECASE):
-                return True
-        return False
+    def _match(patterns: Tuple[str, ...], target: str) -> bool:
+        return any(re.search(p, target, flags=re.IGNORECASE) for p in patterns)
 
-    if _matches_any(cfg.search_patterns, combined_for_search):
+    if _match(cfg.search_patterns, combined):
         return "search"
-
-    if _matches_any(cfg.static_patterns, path):
+    if _match(cfg.static_patterns, path):
         return "static"
-
-    if _matches_any(cfg.category_patterns, path):
+    if _match(cfg.category_patterns, path):
         return "categories"
-
-    if _matches_any(cfg.blog_patterns, path):
+    if _match(cfg.blog_patterns, path):
         return "blog_posts"
-
-    if _matches_any(cfg.profile_patterns, path):
+    if _match(cfg.profile_patterns, path):
         return "profiles"
-
     return "other"
 
 
-def classify_by_source_sitemap(source_sitemap: str) -> Optional[str]:
-    source = (source_sitemap or "").lower()
-
-    if "data_post-" in source:
-        return "blog_posts"
-    if "data_category-" in source:
-        return "categories"
-    if "static_pages-" in source:
-        return "static"
-    if "profile_search_results-" in source:
-        return "search"
-    if "profile-filename-reviews" in source or "review_filename" in source:
-        return "other"
-    if "photo_group_profile-" in source:
-        return "other"
-    if "/profile-filename-" in source and "reviews" not in source:
-        return "profiles"
-
-    return None
-
-
 def apply_classification(rows: List[UrlRow], cfg: ClassifierConfig) -> List[UrlRow]:
-    out: List[UrlRow] = []
-    for r in rows:
-        source_mapped_type = classify_by_source_sitemap(r.source_sitemap)
-        out.append(
-            UrlRow(
-                url=r.url,
-                url_type=source_mapped_type or classify_url(r.url, cfg),
-                source_sitemap=r.source_sitemap,
-                lastmod=r.lastmod,
-            )
-        )
-    return out
+    return [UrlRow(url=r.url, url_type=classify_url(r.url, cfg), source_sitemap=r.source_sitemap, lastmod=r.lastmod) for r in rows]
 
 
-# -----------------------------
-# Inventory Engine
-# -----------------------------
+def _disk_cache_paths_inventory(sitemap_index_url: str) -> Tuple[str, str]:
+    _ensure_cache_dir()
+    key = _stable_key(sitemap_index_url.strip())
+    return os.path.join(CACHE_DIR, f"sitemap_inventory_{key}.json"), os.path.join(CACHE_DIR, f"sitemap_inventory_{key}.csv")
 
-def _parse_manual_child_sitemap_urls(raw_text: str) -> List[str]:
-    urls = []
-    for line in raw_text.splitlines():
-        line = line.strip()
-        if line:
-            urls.append(line)
-    return dedupe_preserve_order(urls)
+
+def load_inventory_disk_cache(sitemap_index_url: str, max_age_hours: float) -> Optional[Tuple[FetchStats, List[UrlRow]]]:
+    json_path, _ = _disk_cache_paths_inventory(sitemap_index_url)
+    if not os.path.exists(json_path):
+        return None
+    try:
+        payload = json.loads(open(json_path, "r", encoding="utf-8").read())
+        fetched_at = payload.get("stats", {}).get("fetched_at_utc")
+        if not fetched_at:
+            return None
+        fetched_dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - fetched_dt).total_seconds() / 3600.0
+        if age > max_age_hours:
+            return None
+        return FetchStats(**payload["stats"]), [UrlRow(**r) for r in payload["rows"]]
+    except Exception:
+        return None
+
+
+def save_inventory_disk_cache(sitemap_index_url: str, stats: FetchStats, rows: List[UrlRow]) -> None:
+    json_path, csv_path = _disk_cache_paths_inventory(sitemap_index_url)
+    payload = {"stats": asdict(stats), "rows": [asdict(r) for r in rows]}
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["url", "url_type", "source_sitemap", "lastmod"])
+        for r in rows:
+            w.writerow([r.url, r.url_type, r.source_sitemap, r.lastmod or ""])
 
 
 @st.cache_data(show_spinner=False)
-def _fetch_inventory_uncached(
+def fetch_inventory_live(
     sitemap_index_url: str,
     timeout_secs: int,
     max_child_sitemaps: int,
     max_urls_per_child: int,
-    manual_mode: bool,
-    manual_index_xml: str,
-    manual_child_urls_text: str,
     debug_enabled: bool,
-) -> Tuple[List[str], List[UrlRow], List[str], Dict[str, str]]:
-    """
-    Fetch sitemap index, parse child sitemaps, fetch child urlsets, return (child_sitemaps, rows_unclassified).
-    This function is wrapped by cache; disk-cache is handled outside.
-    """
+) -> Tuple[List[str], List[UrlRow], List[str]]:
     debug_log: List[str] = []
-    child_failures: Dict[str, str] = {}
-    active_debug_log: Optional[List[str]] = debug_log if debug_enabled else None
+    dbg = debug_log if debug_enabled else None
 
-    if manual_mode:
-        manual_child_sitemaps = _parse_manual_child_sitemap_urls(manual_child_urls_text)
-        if manual_child_sitemaps:
-            child_sitemaps = manual_child_sitemaps
-        else:
-            if not manual_index_xml.strip():
-                raise FetchError("Manual XML mode is enabled. Paste sitemap index XML or provide manual child sitemap URLs.")
-            child_sitemaps = parse_sitemap_index(manual_index_xml)
-            if not child_sitemaps:
-                raise FetchError("Manual sitemap XML did not produce any child sitemap URLs.")
-    else:
-        xml = http_get_text(sitemap_index_url, timeout_secs=timeout_secs, debug_log=active_debug_log)
-        child_sitemaps = parse_sitemap_index(xml)
-
-        # If user gave a direct child sitemap (urlset), treat index as the only sitemap
-        if not child_sitemaps:
-            child_sitemaps = [sitemap_index_url]
-
+    xml = http_get_text(sitemap_index_url, timeout_secs, dbg)
+    child_sitemaps = parse_sitemap_index(xml)
+    if not child_sitemaps:
+        child_sitemaps = [sitemap_index_url]
     child_sitemaps = child_sitemaps[:max_child_sitemaps]
 
     rows: List[UrlRow] = []
     for sm_url in child_sitemaps:
-        try:
-            sm_xml = http_get_text(sm_url, timeout_secs=timeout_secs, debug_log=active_debug_log)
-            child_failures[sm_url] = "OK"
-        except FetchError as e:
-            child_failures[sm_url] = str(e)
-            _append_debug(active_debug_log, f"Child sitemap failed: {sm_url} -> {e}")
-            continue
-
-        # Some "child sitemaps" are themselves sitemap indexes (nested). Support one level of nesting.
+        sm_xml = http_get_text(sm_url, timeout_secs, dbg)
         nested = parse_sitemap_index(sm_xml)
         if nested:
-            nested = nested[:max_child_sitemaps]
-            for nested_url in nested:
-                try:
-                    nested_xml = http_get_text(nested_url, timeout_secs=timeout_secs, debug_log=active_debug_log)
-                    child_failures[nested_url] = "OK"
-                except FetchError as e:
-                    child_failures[nested_url] = str(e)
-                    _append_debug(active_debug_log, f"Nested child sitemap failed: {nested_url} -> {e}")
-                    continue
-                nested_root = _xml_root_localname(nested_xml)
-                nested_rows = parse_urlset(nested_xml, source_sitemap_url=nested_url)
-                _append_debug(
-                    active_debug_log,
-                    f"Child sitemap parsed: url={nested_url}, root={nested_root}, urls_extracted={len(nested_rows)}",
-                )
-                if nested_root == "urlset" and not nested_rows:
-                    snippet = nested_xml.strip().replace("\n", " ")[:200]
-                    _append_debug(
-                        active_debug_log,
-                        f"WARNING: urlset sitemap returned 0 urls: {nested_url}; first_200_chars={snippet}",
-                    )
-                if max_urls_per_child > 0:
-                    nested_rows = nested_rows[:max_urls_per_child]
-                rows.extend(nested_rows)
-            continue
+            for nested_url in nested[:max_child_sitemaps]:
+                nested_xml = http_get_text(nested_url, timeout_secs, dbg)
+                nested_rows = parse_urlset(nested_xml, nested_url)
+                rows.extend(nested_rows[:max_urls_per_child] if max_urls_per_child > 0 else nested_rows)
+        else:
+            sm_rows = parse_urlset(sm_xml, sm_url)
+            rows.extend(sm_rows[:max_urls_per_child] if max_urls_per_child > 0 else sm_rows)
 
-        sm_root = _xml_root_localname(sm_xml)
-        sm_rows = parse_urlset(sm_xml, source_sitemap_url=sm_url)
-        _append_debug(
-            active_debug_log,
-            f"Child sitemap parsed: url={sm_url}, root={sm_root}, urls_extracted={len(sm_rows)}",
-        )
-        if sm_root == "urlset" and not sm_rows:
-            snippet = sm_xml.strip().replace("\n", " ")[:200]
-            _append_debug(
-                active_debug_log,
-                f"WARNING: urlset sitemap returned 0 urls: {sm_url}; first_200_chars={snippet}",
-            )
-        if max_urls_per_child > 0:
-            sm_rows = sm_rows[:max_urls_per_child]
-        rows.extend(sm_rows)
-
-    return child_sitemaps, rows, debug_log, child_failures
+    return child_sitemaps, rows, debug_log
 
 
 def build_inventory(
     sitemap_index_url: str,
-    classifier: ClassifierConfig,
     timeout_secs: int,
     max_child_sitemaps: int,
     max_urls_per_child: int,
     disk_cache_max_age_hours: float,
     force_refresh: bool,
-    manual_mode: bool,
-    manual_index_xml: str,
-    manual_child_urls_text: str,
     debug_enabled: bool,
-) -> Tuple[FetchStats, List[UrlRow], List[str], Dict[str, str]]:
-    """
-    Primary orchestration: uses disk cache unless forced, else fetches and saves to disk.
-    """
+) -> Tuple[FetchStats, List[UrlRow], List[str]]:
     start = time.time()
-
-    # Manual mode is always live input; skip disk cache read/write.
-    if not manual_mode and not force_refresh:
-        disk = load_disk_cache(sitemap_index_url, max_age_hours=disk_cache_max_age_hours)
-        if disk is not None:
+    if not force_refresh:
+        disk = load_inventory_disk_cache(sitemap_index_url, disk_cache_max_age_hours)
+        if disk:
             stats, rows = disk
-            # Re-classify with current patterns (so changes in patterns update without re-fetch)
-            rows = apply_classification(rows, classifier)
+            rows = apply_classification(rows, DEFAULT_CLASSIFIER)
             stats = FetchStats(
                 sitemap_index_url=stats.sitemap_index_url,
                 fetched_at_utc=stats.fetched_at_utc,
@@ -667,21 +398,12 @@ def build_inventory(
                 elapsed_seconds=round(time.time() - start, 3),
                 cache_used=True,
             )
-            return stats, rows, ["Loaded inventory from disk cache; no HTTP fetch attempts were made."], {}
+            return stats, rows, ["Loaded inventory from disk cache."]
 
-    child_sitemaps, rows_unclassified, debug_log, child_failures = _fetch_inventory_uncached(
-        sitemap_index_url=sitemap_index_url,
-        timeout_secs=timeout_secs,
-        max_child_sitemaps=max_child_sitemaps,
-        max_urls_per_child=max_urls_per_child,
-        manual_mode=manual_mode,
-        manual_index_xml=manual_index_xml,
-        manual_child_urls_text=manual_child_urls_text,
-        debug_enabled=debug_enabled,
+    child_sitemaps, unclassified, debug_log = fetch_inventory_live(
+        sitemap_index_url, timeout_secs, max_child_sitemaps, max_urls_per_child, debug_enabled
     )
-
-    rows = apply_classification(rows_unclassified, classifier)
-
+    rows = apply_classification(unclassified, DEFAULT_CLASSIFIER)
     stats = FetchStats(
         sitemap_index_url=sitemap_index_url,
         fetched_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -691,303 +413,533 @@ def build_inventory(
         elapsed_seconds=round(time.time() - start, 3),
         cache_used=False,
     )
-
-    if not manual_mode and rows:
-        save_disk_cache(sitemap_index_url, stats, rows)
-    return stats, rows, debug_log, child_failures
-
-
-# -----------------------------
-# CSV Export Helpers
-# -----------------------------
-
-def rows_to_csv_bytes(rows: List[UrlRow]) -> bytes:
-    import io
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["url", "url_type", "source_sitemap", "lastmod"])
-    for r in rows:
-        writer.writerow([r.url, r.url_type, r.source_sitemap, r.lastmod or ""])
-    return buf.getvalue().encode("utf-8")
+    if rows:
+        save_inventory_disk_cache(sitemap_index_url, stats, rows)
+    return stats, rows, debug_log
 
 
-def summarize_counts(rows: List[UrlRow]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for r in rows:
-        counts[r.url_type] = counts.get(r.url_type, 0) + 1
-    # ensure stable keys even if empty
-    for k in ("profiles", "blog_posts", "categories", "static", "search", "other"):
-        counts.setdefault(k, 0)
-    return counts
+def _normalize_domain(url: str) -> str:
+    if not url:
+        return ""
+    host = (urlparse(url).hostname or "").lower()
+    return host[4:] if host.startswith("www.") else host
 
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
+def _slug_to_name(url: str) -> str:
+    path = (urlparse(url).path or "").strip("/")
+    if not path:
+        return _normalize_domain(url)
+    slug = path.split("/")[-1]
+    slug = slug.replace("_", "-")
+    slug = re.sub(r"[-]+", " ", slug)
+    slug = re.sub(r"\s+", " ", slug).strip()
+    return slug or _normalize_domain(url)
 
-def _patterns_editor(title: str, patterns: Tuple[str, ...], help_text: str) -> Tuple[str, ...]:
-    st.caption(help_text)
-    text = st.text_area(title, value="\n".join(patterns), height=140)
-    cleaned = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        cleaned.append(line)
-    return tuple(cleaned)
+
+def normalize_name(text: str, destination_word: str = "") -> str:
+    stopwords = {"the", "a", "an", "hotel", "resort", "inn", "lodge", "suites"}
+    if destination_word:
+        stopwords.add(destination_word.lower())
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    tokens = [t for t in cleaned.split() if t and t not in stopwords]
+    return " ".join(tokens)
+
+
+def build_inventory_entities(rows: List[UrlRow], destination: str) -> List[InventoryEntity]:
+    entities = []
+    for row in rows:
+        name = _slug_to_name(row.url)
+        entities.append(
+            InventoryEntity(
+                url=row.url,
+                domain=_normalize_domain(row.url),
+                derived_name=name,
+                normalized_name=normalize_name(name, destination),
+            )
+        )
+    return entities
+
+
+def token_set_similarity(a: str, b: str) -> float:
+    a_tokens, b_tokens = set(a.split()), set(b.split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+    inter = len(a_tokens & b_tokens)
+    score = (2 * inter) / (len(a_tokens) + len(b_tokens))
+    return round(score * 100, 2)
+
+
+def fuzzy_score(a: str, b: str) -> float:
+    try:
+        from rapidfuzz import fuzz  # type: ignore
+
+        return float(fuzz.token_set_ratio(a, b))
+    except Exception:
+        return token_set_similarity(a, b)
+
+
+def _serp_cache_paths(cache_key: str) -> Tuple[str, str]:
+    _ensure_cache_dir()
+    return os.path.join(CACHE_DIR, f"serp_{cache_key}.json"), os.path.join(CACHE_DIR, f"serp_{cache_key}_meta.json")
+
+
+def _serp_cache_key(parts: Dict[str, str]) -> str:
+    stable = json.dumps(parts, sort_keys=True)
+    return _stable_key(stable)
+
+
+def load_serp_disk_cache(parts: Dict[str, str], max_age_hours: float) -> Optional[dict]:
+    key = _serp_cache_key(parts)
+    json_path, meta_path = _serp_cache_paths(key)
+    if not os.path.exists(json_path) or not os.path.exists(meta_path):
+        return None
+    try:
+        payload = json.loads(open(json_path, "r", encoding="utf-8").read())
+        meta = json.loads(open(meta_path, "r", encoding="utf-8").read())
+        fetched_at = datetime.fromisoformat(meta["fetched_at_utc"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - fetched_at).total_seconds() / 3600.0
+        if age > max_age_hours:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def save_serp_disk_cache(parts: Dict[str, str], payload: dict) -> None:
+    if not payload:
+        return
+    key = _serp_cache_key(parts)
+    json_path, meta_path = _serp_cache_paths(key)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({"fetched_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}, f, indent=2)
+
+
+@st.cache_data(show_spinner=False)
+def serpapi_search_cached(params: Dict[str, str], timeout_secs: int) -> dict:
+    with requests.Session() as session:
+        backoffs = (0.8, 1.6, 3.2)
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                resp = session.get(SERP_API_URL, params=params, timeout=timeout_secs)
+                if resp.status_code >= 500 or resp.status_code in {429}:
+                    raise FetchError(f"SerpAPI HTTP {resp.status_code}", retryable=True)
+                if resp.status_code >= 400:
+                    raise FetchError(f"SerpAPI HTTP {resp.status_code}: {resp.text[:250]}")
+                data = resp.json()
+                if data.get("error"):
+                    raise FetchError(f"SerpAPI error: {data['error']}")
+                return data
+            except (requests.RequestException, ValueError, FetchError) as e:
+                last_error = e
+                retryable = isinstance(e, requests.RequestException) or (isinstance(e, FetchError) and e.retryable)
+                if not retryable or attempt == 3:
+                    break
+                time.sleep(backoffs[min(attempt - 1, len(backoffs) - 1)])
+        raise FetchError(f"SerpAPI request failed: {last_error}")
+
+
+def run_serp_request(
+    params: Dict[str, str],
+    timeout_secs: int,
+    cache_max_age_hours: float,
+    force_refresh: bool,
+    debug_log: List[str],
+) -> dict:
+    parts = {k: str(v) for k, v in params.items() if k != "api_key"}
+    if not force_refresh:
+        cached = load_serp_disk_cache(parts, cache_max_age_hours)
+        if cached is not None:
+            _append_debug(debug_log, f"SERP cache hit: engine={params.get('engine')} q={params.get('q')} start={params.get('start', 0)}")
+            return cached
+
+    _append_debug(debug_log, f"SERP query: engine={params.get('engine')} q={params.get('q')} start={params.get('start', 0)}")
+    data = serpapi_search_cached(params, timeout_secs)
+    if data:
+        save_serp_disk_cache(parts, data)
+    return data
+
+
+def clean_query(template: str, destination: str, region: str, country: str) -> str:
+    query = template.format(destination=destination.strip(), region=region.strip(), country=country.strip())
+    return re.sub(r"\s+", " ", query).strip()
+
+
+def build_query_seeds(destination: str, region: str, country: str, category: str, custom_text: str) -> List[str]:
+    if custom_text.strip():
+        return dedupe_preserve_order([line.strip() for line in custom_text.splitlines() if line.strip()])
+    templates = CATEGORY_QUERY_TEMPLATES.get(category, [])
+    return [clean_query(t, destination, region, country) for t in templates]
+
+
+def extract_organic_candidates(payload: dict) -> List[dict]:
+    out = []
+    for item in payload.get("organic_results", []) or []:
+        out.append(
+            {
+                "name": item.get("title", ""),
+                "address": "",
+                "phone": "",
+                "rating": None,
+                "reviews": None,
+                "website": item.get("link", ""),
+                "place_id": item.get("place_id") or item.get("result_id") or "",
+                "source_engine": "google",
+            }
+        )
+    return out
+
+
+def _to_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    txt = re.sub(r"[^0-9]", "", str(value))
+    return int(txt) if txt else None
+
+
+def _to_float(value: object) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def extract_maps_candidates(payload: dict) -> List[dict]:
+    results = payload.get("local_results") or payload.get("places_results") or []
+    out = []
+    for item in results:
+        out.append(
+            {
+                "name": item.get("title", ""),
+                "address": item.get("address", ""),
+                "phone": item.get("phone", ""),
+                "rating": _to_float(item.get("rating")),
+                "reviews": _to_int(item.get("reviews") or item.get("reviews_original")),
+                "website": item.get("website", ""),
+                "place_id": item.get("place_id") or item.get("data_id") or item.get("data_cid") or "",
+                "source_engine": "google_maps",
+            }
+        )
+    return out
+
+
+def aggregate_candidates(raw_candidates: List[dict], destination: str) -> List[dict]:
+    by_key: Dict[str, dict] = {}
+    for c in raw_candidates:
+        domain = _normalize_domain(c.get("website", ""))
+        norm_name = normalize_name(c.get("name", ""), destination)
+        key = domain or f"{norm_name}|{(c.get('address') or '').lower()}"
+        if key not in by_key:
+            by_key[key] = {
+                "candidate_name": c.get("name", ""),
+                "normalized_name": norm_name,
+                "address": c.get("address", ""),
+                "phone": c.get("phone", ""),
+                "rating": c.get("rating"),
+                "reviews": c.get("reviews") or 0,
+                "website": c.get("website", ""),
+                "normalized_domain": domain,
+                "place_id": c.get("place_id", ""),
+                "engines": {c.get("source_engine", "")},
+                "queries": set(),
+            }
+        else:
+            item = by_key[key]
+            item["engines"].add(c.get("source_engine", ""))
+            item["reviews"] = max(item.get("reviews") or 0, c.get("reviews") or 0)
+            if not item.get("website") and c.get("website"):
+                item["website"] = c.get("website")
+                item["normalized_domain"] = domain
+            if (item.get("rating") or 0) < (c.get("rating") or 0):
+                item["rating"] = c.get("rating")
+    return list(by_key.values())
+
+
+def apply_matching(candidates: List[dict], inventory_entities: List[InventoryEntity], threshold: int) -> Tuple[List[dict], List[dict], List[dict]]:
+    missing, possible, listed = [], [], []
+
+    by_domain: Dict[str, List[InventoryEntity]] = {}
+    for inv in inventory_entities:
+        if inv.domain:
+            by_domain.setdefault(inv.domain, []).append(inv)
+
+    for c in candidates:
+        best_url = ""
+        best_score = 0.0
+        match_type = "none"
+
+        c_domain = c.get("normalized_domain", "")
+        if c_domain and c_domain in by_domain:
+            best_url = by_domain[c_domain][0].url
+            best_score = 100.0
+            match_type = "domain"
+        else:
+            cname = c.get("normalized_name", "")
+            for inv in inventory_entities:
+                score = fuzzy_score(cname, inv.normalized_name)
+                if score > best_score:
+                    best_score = score
+                    best_url = inv.url
+            if best_score > 0:
+                match_type = "name_fuzzy"
+
+        c["best_match_url"] = best_url
+        c["best_match_score"] = round(best_score, 2)
+        c["match_type"] = match_type
+
+        candidate_score = 0
+        if "google_maps" in c.get("engines", set()):
+            candidate_score += 3
+        if len(c.get("queries", set())) >= 2:
+            candidate_score += 2
+        if c.get("website"):
+            candidate_score += 1
+        if (c.get("rating") or 0) >= 4.5:
+            candidate_score += 1
+        if (c.get("reviews") or 0) >= 200:
+            candidate_score += 1
+        c["candidate_score"] = candidate_score
+
+        if best_score >= threshold:
+            listed.append(c)
+        elif threshold - 10 <= best_score < threshold:
+            possible.append(c)
+        else:
+            missing.append(c)
+
+    missing.sort(key=lambda x: (x.get("candidate_score", 0), x.get("reviews", 0)), reverse=True)
+    possible.sort(key=lambda x: x.get("best_match_score", 0), reverse=True)
+    listed.sort(key=lambda x: x.get("best_match_score", 0), reverse=True)
+    return missing, possible, listed
+
+
+def rows_to_csv_bytes(rows: List[Dict[str, object]]) -> bytes:
+    if not rows:
+        return b""
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue().encode("utf-8")
+
+
+def render_inventory_page() -> None:
+    st.subheader("Milestone 1 — Inventory")
+    with st.sidebar:
+        st.header("Inventory Settings")
+        sitemap_index_url = st.text_input("Sitemap index URL", value="https://vailvacay.com/sitemap_index.xml").strip()
+        timeout_secs = st.number_input("HTTP timeout (seconds)", min_value=5, max_value=60, value=DEFAULT_TIMEOUT_SECS)
+        max_child_sitemaps = st.number_input("Max child sitemaps", min_value=1, max_value=500, value=150)
+        max_urls_per_child = st.number_input("Max URLs per child sitemap (0=no limit)", min_value=0, max_value=200000, value=0)
+        disk_cache_max_age_hours = st.number_input("Use disk cache if newer than (hours)", min_value=0.0, max_value=168.0, value=12.0)
+        force_refresh = st.checkbox("Force refresh (ignore disk cache)", value=False)
+        show_debug_log = st.checkbox("Show debug log", value=False)
+        run = st.button("Run inventory scan", type="primary")
+
+    if not run:
+        st.info("Configure settings in the sidebar, then click **Run inventory scan**.")
+        return
+
+    try:
+        with st.spinner("Fetching and parsing sitemaps..."):
+            stats, rows, debug_log = build_inventory(
+                sitemap_index_url,
+                int(timeout_secs),
+                int(max_child_sitemaps),
+                int(max_urls_per_child),
+                float(disk_cache_max_age_hours),
+                bool(force_refresh),
+                bool(show_debug_log),
+            )
+    except Exception as e:
+        st.error(f"Inventory scan failed: {e}")
+        st.stop()
+
+    st.metric("Inventory URLs", stats.urls_found)
+    st.caption(f"Fetched at: {stats.fetched_at_utc} • Cache used: {'Yes' if stats.cache_used else 'No'} • Elapsed: {stats.elapsed_seconds}s")
+
+    table = [{"url": r.url, "url_type": r.url_type, "source_sitemap": r.source_sitemap, "lastmod": r.lastmod or ""} for r in rows]
+    st.dataframe(table, use_container_width=True, height=500)
+    st.download_button("Download inventory CSV", data=rows_to_csv_bytes(table), file_name="vacayrank_inventory.csv", mime="text/csv")
+
+    if show_debug_log and debug_log:
+        st.subheader("Debug log")
+        st.code("\n".join(debug_log), language="text")
+
+
+def render_serp_gap_page() -> None:
+    st.subheader("Milestone 2 — SERP Gap")
+    api_key = os.getenv("SERPAPI_API_KEY", "").strip()
+
+    with st.sidebar:
+        st.header("SERP Gap Settings")
+        sitemap_index_url = st.text_input("Sitemap index URL", value="https://vailvacay.com/sitemap_index.xml").strip()
+        destination = st.text_input("Destination", value="Vail").strip()
+        region = st.text_input("Region/State", value="CO").strip()
+        country = st.text_input("Country", value="US").strip()
+        category = st.selectbox("Category", options=["Hotels", "Restaurants", "Activities", "Nightlife", "Shopping"])
+        custom_seeds = st.text_area("Custom query seeds (one per line)", value="", height=120)
+        organic_pages = st.number_input("Organic pages to fetch", min_value=1, max_value=10, value=2)
+        maps_pages = st.number_input("Maps pages to fetch", min_value=1, max_value=10, value=2)
+        threshold = st.slider("Fuzzy threshold", min_value=0, max_value=100, value=88)
+        serp_cache_age = st.number_input("Use disk cache if newer than (hours)", min_value=0.0, max_value=168.0, value=12.0)
+        force_refresh = st.checkbox("Force refresh (ignore disk cache)", value=False)
+        show_debug_log = st.checkbox("Show debug log", value=False)
+        run_disabled = not bool(api_key)
+        run = st.button("Run SERP Gap Scan", type="primary", disabled=run_disabled)
+
+    if not api_key:
+        st.error("SERPAPI_API_KEY is missing. Set it in your environment/secrets to run Milestone 2.")
+
+    if not run:
+        st.info("Configure settings in the sidebar, then click **Run SERP Gap Scan**.")
+        return
+
+    debug_log: List[str] = []
+
+    try:
+        with st.spinner("Loading directory inventory..."):
+            _, inventory_rows, _ = build_inventory(
+                sitemap_index_url=sitemap_index_url,
+                timeout_secs=DEFAULT_TIMEOUT_SECS,
+                max_child_sitemaps=200,
+                max_urls_per_child=0,
+                disk_cache_max_age_hours=float(serp_cache_age),
+                force_refresh=bool(force_refresh),
+                debug_enabled=False,
+            )
+    except Exception as e:
+        st.error(f"Failed to load inventory for matching: {e}")
+        st.stop()
+
+    queries = build_query_seeds(destination, region, country, category, custom_seeds)
+    location_value = ", ".join([x for x in [destination, region, country] if x])
+    raw_candidates: List[dict] = []
+
+    try:
+        for q in queries:
+            for page_idx in range(int(organic_pages)):
+                params = {
+                    "engine": "google",
+                    "q": q,
+                    "api_key": api_key,
+                    "hl": "en",
+                    "gl": (country or "us").lower(),
+                    "num": "10",
+                    "start": str(page_idx * 10),
+                }
+                if location_value:
+                    params["location"] = location_value
+                payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(serp_cache_age), bool(force_refresh), debug_log)
+                organic = extract_organic_candidates(payload)
+                _append_debug(debug_log, f"Organic extracted: query='{q}' page={page_idx + 1} count={len(organic)}")
+                for c in organic:
+                    c["query"] = q
+                raw_candidates.extend(organic)
+
+            maps_query = f"{category.lower()} in {destination} {region}".strip()
+            for page_idx in range(int(maps_pages)):
+                params = {
+                    "engine": "google_maps",
+                    "q": maps_query,
+                    "api_key": api_key,
+                    "hl": "en",
+                    "gl": (country or "us").lower(),
+                    "start": str(page_idx * 20),
+                }
+                if location_value:
+                    params["location"] = location_value
+                payload = run_serp_request(params, DEFAULT_TIMEOUT_SECS, float(serp_cache_age), bool(force_refresh), debug_log)
+                maps = extract_maps_candidates(payload)
+                _append_debug(debug_log, f"Maps extracted: query='{maps_query}' page={page_idx + 1} count={len(maps)}")
+                for c in maps:
+                    c["query"] = maps_query
+                raw_candidates.extend(maps)
+    except Exception as e:
+        st.error(f"SERP scan failed: {e}")
+        if show_debug_log and debug_log:
+            st.code("\n".join(debug_log), language="text")
+        st.stop()
+
+    candidates = aggregate_candidates(raw_candidates, destination)
+    for raw in raw_candidates:
+        domain = _normalize_domain(raw.get("website", ""))
+        norm = normalize_name(raw.get("name", ""), destination)
+        key = domain or f"{norm}|{(raw.get('address') or '').lower()}"
+        for c in candidates:
+            ckey = c.get("normalized_domain") or f"{c.get('normalized_name')}|{(c.get('address') or '').lower()}"
+            if ckey == key:
+                c["queries"].add(raw.get("query", ""))
+                break
+
+    inventory_entities = build_inventory_entities(inventory_rows, destination)
+    missing, possible, listed = apply_matching(candidates, inventory_entities, int(threshold))
+
+    st.subheader("Summary")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Inventory count", len(inventory_rows))
+    c2.metric("SERP candidates discovered", len(candidates))
+    c3.metric("Missing", len(missing))
+    c4.metric("Possible matches", len(possible))
+    c5.metric("Already listed", len(listed))
+
+    def _display_rows(items: List[dict]) -> List[Dict[str, object]]:
+        display = []
+        for x in items:
+            display.append(
+                {
+                    "candidate_name": x.get("candidate_name", ""),
+                    "address": x.get("address", ""),
+                    "phone": x.get("phone", ""),
+                    "rating": x.get("rating"),
+                    "reviews": x.get("reviews"),
+                    "website": x.get("website", ""),
+                    "candidate_score": x.get("candidate_score", 0),
+                    "best_match_url": x.get("best_match_url", ""),
+                    "best_match_score": x.get("best_match_score", 0),
+                    "match_type": x.get("match_type", "none"),
+                    "queries_count": len(x.get("queries", set())),
+                    "engines": ",".join(sorted([e for e in x.get("engines", set()) if e])),
+                    "place_id": x.get("place_id", ""),
+                }
+            )
+        return display
+
+    tab1, tab2, tab3 = st.tabs(["Missing", "Possible Matches", "Already Listed"])
+    with tab1:
+        missing_rows = _display_rows(missing)
+        st.dataframe(missing_rows, use_container_width=True, height=450)
+        st.download_button("Download Missing CSV", data=rows_to_csv_bytes(missing_rows), file_name="vacayrank_missing.csv", mime="text/csv")
+    with tab2:
+        possible_rows = _display_rows(possible)
+        st.dataframe(possible_rows, use_container_width=True, height=450)
+        st.download_button("Download Possible Matches CSV", data=rows_to_csv_bytes(possible_rows), file_name="vacayrank_possible_matches.csv", mime="text/csv")
+    with tab3:
+        listed_rows = _display_rows(listed)
+        st.dataframe(listed_rows, use_container_width=True, height=450)
+        st.download_button("Download Already Listed CSV", data=rows_to_csv_bytes(listed_rows), file_name="vacayrank_already_listed.csv", mime="text/csv")
+
+    if show_debug_log:
+        st.subheader("Debug log")
+        st.code("\n".join(debug_log) if debug_log else "No debug entries.", language="text")
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.write(
-        "This milestone reads your sitemap(s), classifies URLs, shows inventory counts, and exports CSV. "
-        "It performs **no write operations**."
-    )
+    st.write("Milestone 1 provides sitemap inventory. Milestone 2 discovers SERP candidates and computes listing gaps.")
 
     with st.sidebar:
-        st.header("Settings")
+        page = st.radio("Navigation", options=["Milestone 1 — Inventory", "Milestone 2 — SERP Gap"])
 
-        sitemap_index_url = st.text_input(
-            "Sitemap index URL",
-            value="https://vailvacay.com/sitemap_index.xml",
-            help="Point to your sitemap index. If you paste a single child sitemap (urlset), it still works.",
-        ).strip()
-
-        manual_mode = st.checkbox("Manual XML mode (paste sitemap index XML)", value=False)
-        show_debug_log = st.checkbox("Show debug log", value=False)
-        manual_index_xml = ""
-        manual_child_urls_text = ""
-        if manual_mode:
-            manual_index_xml = st.text_area(
-                "Manual sitemap index XML",
-                value="",
-                height=180,
-                help="Paste sitemap index XML directly when origin blocks automated fetches.",
-            )
-            manual_child_urls_text = st.text_area(
-                "Manual child sitemap URLs (one per line)",
-                value="",
-                height=120,
-                help="Optional last-resort override: if provided, these URLs are used instead of sitemap URLs parsed from manual XML.",
-            )
-
-        timeout_secs = st.number_input(
-            "HTTP timeout (seconds)",
-            min_value=5,
-            max_value=60,
-            value=DEFAULT_TIMEOUT_SECS,
-            step=1,
-        )
-
-        max_child_sitemaps = st.number_input(
-            "Max child sitemaps to fetch",
-            min_value=1,
-            max_value=5000,
-            value=200,
-            step=10,
-            help="Safety limit. Increase if your sitemap index is large.",
-        )
-
-        max_urls_per_child = st.number_input(
-            "Max URLs per child sitemap (0 = no limit)",
-            min_value=0,
-            max_value=500000,
-            value=0,
-            step=1000,
-            help="Safety limit for very large sitemaps. Use 0 to fetch all URLs.",
-        )
-
-        st.divider()
-        st.subheader("Local disk cache")
-        disk_cache_max_age_hours = st.number_input(
-            "Use disk cache if newer than (hours)",
-            min_value=0.0,
-            max_value=720.0,
-            value=12.0,
-            step=1.0,
-            help="If a cached run exists on disk newer than this age, it will load instantly.",
-        )
-
-        colA, colB = st.columns(2)
-        with colA:
-            force_refresh = st.checkbox("Force refresh (ignore disk cache)", value=False)
-        with colB:
-            if st.button("Purge disk cache"):
-                removed = purge_disk_cache()
-                st.success(f"Removed {removed} cached file(s).")
-
-        st.divider()
-        st.subheader("Classification patterns")
-        st.caption(
-            "Patterns are evaluated in this order: **search → static → categories → blog_posts → profiles → other**. "
-            "Regex is supported."
-        )
-
-        profiles = _patterns_editor(
-            "Profiles patterns (regex, one per line)",
-            DEFAULT_CLASSIFIER.profile_patterns,
-            "Example: /hotels, /restaurants, /activities",
-        )
-        blog_posts = _patterns_editor(
-            "Blog patterns (regex, one per line)",
-            DEFAULT_CLASSIFIER.blog_patterns,
-            "Example: /blog or WordPress /YYYY/MM/DD/",
-        )
-        categories = _patterns_editor(
-            "Category patterns (regex, one per line)",
-            DEFAULT_CLASSIFIER.category_patterns,
-            "Example: /category, /tag",
-        )
-        search = _patterns_editor(
-            "Search patterns (regex, one per line)",
-            DEFAULT_CLASSIFIER.search_patterns,
-            "Example: /search or ?s= query strings",
-        )
-        static = _patterns_editor(
-            "Static patterns (regex, one per line)",
-            DEFAULT_CLASSIFIER.static_patterns,
-            "Example: /about, /contact, /privacy-policy, /",
-        )
-
-        classifier = ClassifierConfig(
-            profile_patterns=profiles,
-            blog_patterns=blog_posts,
-            category_patterns=categories,
-            search_patterns=search,
-            static_patterns=static,
-        )
-
-        st.divider()
-        run = st.button("Run inventory scan", type="primary")
-
-    if not sitemap_index_url:
-        st.warning("Enter a sitemap index URL to begin.")
-        return
-
-    if not run:
-        st.info("Configure settings on the left, then click **Run inventory scan**.")
-        return
-
-    # Execution
-    try:
-        with st.spinner("Fetching and parsing sitemaps..."):
-            stats, rows, debug_log, child_failures = build_inventory(
-                sitemap_index_url=sitemap_index_url,
-                classifier=classifier,
-                timeout_secs=int(timeout_secs),
-                max_child_sitemaps=int(max_child_sitemaps),
-                max_urls_per_child=int(max_urls_per_child),
-                disk_cache_max_age_hours=float(disk_cache_max_age_hours),
-                force_refresh=bool(force_refresh),
-                manual_mode=bool(manual_mode),
-                manual_index_xml=manual_index_xml,
-                manual_child_urls_text=manual_child_urls_text,
-                debug_enabled=bool(show_debug_log),
-            )
-    except FetchError as e:
-        st.error(f"Fetch/parse error: {e}")
-        if "vailvacay.com" in sitemap_index_url.lower() or "www.vailvacay.com" in sitemap_index_url.lower():
-            st.warning("If this looks like bot/WAF blocking, use **Show debug log** to inspect attempts, then use **Manual XML mode** only as a last resort.")
-        st.stop()
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-
-    counts = summarize_counts(rows)
-
-    if stats.urls_found == 0:
-        st.warning(
-            "0 URLs were discovered. The origin may be blocking automated fetches (bot/WAF behavior). "
-            "See the debug diagnostics below for fetch attempts and failing child sitemap URLs."
-        )
-        if child_failures:
-            failed_only = {k: v for k, v in child_failures.items() if v != "OK"}
-            if failed_only:
-                st.error("Child sitemap failures:")
-                st.json(failed_only)
-
-    if show_debug_log or stats.urls_found == 0:
-        st.subheader("Debug log")
-        if debug_log:
-            st.code("\n".join(debug_log), language="text")
-        else:
-            st.caption("No debug lines were captured for this run.")
-
-    # Top stats
-    st.subheader("Overview")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Profiles", counts["profiles"])
-    c2.metric("Blog posts", counts["blog_posts"])
-    c3.metric("Categories", counts["categories"])
-    c4.metric("Static", counts["static"])
-    c5.metric("Search", counts["search"])
-    c6.metric("Other", counts["other"])
-
-    st.caption(
-        f"Sitemap: {stats.sitemap_index_url}  •  "
-        f"Fetched at (UTC): {stats.fetched_at_utc}  •  "
-        f"Child sitemaps fetched: {stats.child_sitemaps_fetched}  •  "
-        f"URLs found: {stats.urls_found}  •  "
-        f"Elapsed: {stats.elapsed_seconds}s  •  "
-        f"Disk cache used: {'Yes' if stats.cache_used else 'No'}"
-    )
-
-    # Download export
-    st.subheader("Export")
-    csv_bytes = rows_to_csv_bytes(rows)
-    st.download_button(
-        "Download CSV",
-        data=csv_bytes,
-        file_name="vacayrank_inventory.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    # Child sitemap list + details
-    st.subheader("Details")
-    tab1, tab2, tab3 = st.tabs(["URL Table", "By Type", "Cache Files"])
-
-    with tab1:
-        st.caption("All discovered URLs (classified). Use the table filters/sort.")
-        st.dataframe(
-            [{"url": r.url, "url_type": r.url_type, "source_sitemap": r.source_sitemap, "lastmod": r.lastmod} for r in rows],
-            use_container_width=True,
-            height=520,
-        )
-
-    with tab2:
-        left, right = st.columns([1, 2])
-        with left:
-            st.caption("Counts by type")
-            st.json(counts)
-        with right:
-            selected = st.selectbox("Show URLs for type", options=["profiles", "blog_posts", "categories", "static", "search", "other"])
-            subset = [r for r in rows if r.url_type == selected]
-            st.write(f"Found **{len(subset)}** URLs for **{selected}**.")
-            st.dataframe(
-                [{"url": r.url, "source_sitemap": r.source_sitemap, "lastmod": r.lastmod} for r in subset],
-                use_container_width=True,
-                height=520,
-            )
-
-    with tab3:
-        _ensure_cache_dir()
-        json_path, csv_path = _disk_cache_paths(sitemap_index_url)
-        st.write("Disk cache locations for this sitemap index URL:")
-        st.code(json_path)
-        st.code(csv_path)
-        st.caption("Tip: Commit **nothing** from vacayrank_cache to GitHub (add to .gitignore).")
-        if manual_mode:
-            st.info("Manual XML mode is enabled; disk cache read/write is skipped for this run.")
-
-    # Lightweight recommendation block (non-placeholder, actionable)
-    st.subheader("Next Step (Milestone 2 preview)")
-    st.write(
-        "Once inventory is stable, the next milestone typically adds **diffing** (today vs prior run), "
-        "**per-type sampling/validation**, and **BD API mapping** (read-only) so we can prepare safe write operations later."
-    )
+    if page == "Milestone 1 — Inventory":
+        render_inventory_page()
+    else:
+        render_serp_gap_page()
 
 
 if __name__ == "__main__":
+    _ensure_cache_dir()
     main()
