@@ -16,6 +16,7 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 import streamlit as st
+import pandas as pd
 
 try:
     from rapidfuzz import fuzz
@@ -33,6 +34,10 @@ XML_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
 CATEGORY_CONFIG = {
     "Hotels": {
+        "inventory_categories": ["hotel", "hotels", "lodging", "stay"],
+        "inventory_category_field": "category",
+        "synonyms": ["resort", "inn"],
+        "strategic_weight": 1.2,
         "query_templates": [
             "hotels in {destination} {region}",
             "best hotels in {destination} {region}",
@@ -43,6 +48,10 @@ CATEGORY_CONFIG = {
         "serp_entity_stopwords": ["hotel", "resort", "lodge", "inn", "suites", "collection", "club", "spa", "accommodations"],
     },
     "Restaurants": {
+        "inventory_categories": ["restaurant", "restaurants", "dining"],
+        "inventory_category_field": "category",
+        "synonyms": ["eatery", "bistro", "cafe"],
+        "strategic_weight": 1.1,
         "query_templates": [
             "restaurants in {destination} {region}",
             "best restaurants in {destination} {region}",
@@ -53,6 +62,10 @@ CATEGORY_CONFIG = {
         "serp_entity_stopwords": ["restaurant", "grill", "kitchen", "eatery", "bar", "bistro", "cafe"],
     },
     "Bars": {
+        "inventory_categories": ["bar", "bars", "nightlife"],
+        "inventory_category_field": "category",
+        "synonyms": ["pub", "lounge", "tavern"],
+        "strategic_weight": 1.0,
         "query_templates": [
             "bars in {destination} {region}",
             "best bars in {destination} {region}",
@@ -63,6 +76,10 @@ CATEGORY_CONFIG = {
         "serp_entity_stopwords": ["bar", "pub", "lounge", "tavern", "nightclub", "cocktail"],
     },
     "Attractions": {
+        "inventory_categories": ["attraction", "attractions", "activities", "things to do"],
+        "inventory_category_field": "category",
+        "synonyms": ["tour", "experience"],
+        "strategic_weight": 1.4,
         "query_templates": [
             "attractions in {destination} {region}",
             "things to do in {destination} {region}",
@@ -73,6 +90,10 @@ CATEGORY_CONFIG = {
         "serp_entity_stopwords": ["attraction", "adventure", "tour", "experience", "activity", "park"],
     },
     "Shops": {
+        "inventory_categories": ["shop", "shops", "shopping"],
+        "inventory_category_field": "category",
+        "synonyms": ["store", "boutique", "market"],
+        "strategic_weight": 0.9,
         "query_templates": [
             "shops in {destination} {region}",
             "shopping in {destination} {region}",
@@ -83,6 +104,10 @@ CATEGORY_CONFIG = {
         "serp_entity_stopwords": ["shop", "store", "boutique", "market", "outlet"],
     },
     "Ski Rentals": {
+        "inventory_categories": ["ski rentals", "rental", "rentals", "equipment rentals"],
+        "inventory_category_field": "category",
+        "synonyms": ["snowboard rentals", "ski shop"],
+        "strategic_weight": 1.5,
         "query_templates": [
             "ski rentals in {destination} {region}",
             "snowboard rentals in {destination} {region}",
@@ -384,6 +409,218 @@ def rows_to_csv_bytes(rows: List[Dict[str, object]]) -> bytes:
     writer.writeheader()
     writer.writerows(rows)
     return out.getvalue().encode("utf-8")
+
+
+def get_inventory_for_category(category_key: str, inventory_df: pd.DataFrame, category_cfg: dict) -> tuple[pd.DataFrame, dict]:
+    report = {
+        "category": category_key,
+        "inventory_total_rows": int(len(inventory_df)),
+        "inventory_rows_for_category": 0,
+        "inventory_filter_field_used": None,
+        "inventory_filter_labels_used": [],
+        "inventory_filter_strategy": "none",
+        "fallback": "none",
+        "reason": "",
+    }
+    if inventory_df.empty:
+        report["reason"] = "inventory empty"
+        return inventory_df.iloc[0:0], report
+
+    labels = [category_key] + list(category_cfg.get("inventory_categories", []) or []) + list(category_cfg.get("synonyms", []) or [])
+    labels_norm = sorted({_clean_text(x) for x in labels if str(x).strip()})
+    report["inventory_filter_labels_used"] = labels_norm
+
+    configured_field = category_cfg.get("inventory_category_field")
+    candidate_fields = [configured_field] if configured_field else []
+    candidate_fields += ["category", "categories", "type"]
+    field_used = next((f for f in candidate_fields if f and f in inventory_df.columns), None)
+    report["inventory_filter_field_used"] = field_used
+
+    if not field_used:
+        report["reason"] = "no usable category field"
+        return inventory_df.iloc[0:0], report
+
+    def _values(cell: object) -> List[str]:
+        if isinstance(cell, list):
+            vals = cell
+        elif isinstance(cell, str):
+            vals = [x.strip() for x in re.split(r"[,|;/]", cell) if x.strip()]
+        else:
+            vals = [str(cell)] if cell is not None else []
+        return [_clean_text(x) for x in vals if str(x).strip()]
+
+    series = inventory_df[field_used]
+    has_multi = series.apply(lambda x: isinstance(x, list)).any() or series.astype(str).str.contains(r"[,|;/]", na=False, regex=True).any()
+    strategy = "list-membership" if has_multi else "exact"
+
+    label_set = set(labels_norm)
+    mask = inventory_df[field_used].apply(lambda x: bool(set(_values(x)) & label_set))
+    filtered = inventory_df[mask].copy()
+    report["inventory_filter_strategy"] = strategy
+    report["inventory_rows_for_category"] = int(len(filtered))
+    if filtered.empty:
+        report["reason"] = "no match"
+    return filtered, report
+
+
+def _milestone3_cache_path(cache_key: str) -> str:
+    _ensure_cache_dir()
+    return os.path.join(CACHE_DIR, f"milestone3_{cache_key}.json")
+
+
+def _milestone3_cache_key(parts: dict) -> str:
+    return _stable_key(json.dumps(parts, sort_keys=True))
+
+
+def load_milestone3_disk_cache(parts: dict, max_age_hours: float) -> Optional[dict]:
+    path = _milestone3_cache_path(_milestone3_cache_key(parts))
+    if not os.path.exists(path):
+        return None
+    try:
+        payload = json.loads(open(path, "r", encoding="utf-8").read())
+        fetched_dt = datetime.fromisoformat(payload["fetched_at_utc"].replace("Z", "+00:00"))
+        age_hours = (datetime.now(timezone.utc) - fetched_dt).total_seconds() / 3600
+        return None if age_hours > max_age_hours else payload.get("rows", {})
+    except Exception:
+        return None
+
+
+def save_milestone3_disk_cache(parts: dict, rows: dict) -> None:
+    path = _milestone3_cache_path(_milestone3_cache_key(parts))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"fetched_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "parts": parts, "rows": rows}, f, ensure_ascii=False, indent=2)
+
+
+def _intent_signal_count(queries: Iterable[str]) -> int:
+    words = ["best", "top", "near me", "book", "reservations", "rental", "rentals", "tickets", "tour", "tours", "luxury", "family", "cheap", "deals"]
+    found = set()
+    for query in queries:
+        q = (query or "").lower()
+        for w in words:
+            if w in q:
+                found.add(w)
+    return len(found)
+
+
+def _strategic_score(weight: float) -> int:
+    return max(0, min(10, round(5 * float(weight))))
+
+
+def build_milestone3_scores(results_by_category: Dict[str, dict], selected_categories: List[str], category_config: dict, include_possible: bool) -> Tuple[List[dict], List[dict], dict]:
+    category_stats = {}
+    for category in selected_categories:
+        cat = results_by_category.get(category, {})
+        serp_found = len(cat.get("candidates", []))
+        missing_count = len(cat.get("missing", []))
+        gap_ratio = missing_count / max(1, serp_found)
+        category_stats[category] = {
+            "serp_found": serp_found,
+            "missing_count": missing_count,
+            "gap_ratio": gap_ratio,
+            "gap_score": round(20 * max(0, min(1, gap_ratio))),
+            "strategic_score": _strategic_score(category_config.get(category, {}).get("strategic_weight", 1.0)),
+        }
+
+    scored_rows = []
+    for category in selected_categories:
+        cat_results = results_by_category.get(category, {})
+        source_rows = [{**x, "candidate_status": "Missing"} for x in cat_results.get("missing", [])]
+        if include_possible:
+            source_rows += [{**x, "candidate_status": "Possible"} for x in cat_results.get("possible", [])]
+        duplicate_urls = {m.get("url", "") for m in cat_results.get("duplicates", ([], [], 0))[1]}
+        for candidate in source_rows:
+            rank = candidate.get("rank") or 999
+            appearances = len(candidate.get("queries", set()))
+            if rank <= 3:
+                visibility = 35
+            elif rank <= 10:
+                visibility = 25
+            elif rank <= 20:
+                visibility = 15
+            else:
+                visibility = 8
+            visibility = min(35, visibility + min(10, 2 * appearances))
+            demand = min(20, 5 * _intent_signal_count(candidate.get("queries", set())))
+            gap_score = category_stats[category]["gap_score"]
+            conf = 0
+            if candidate.get("website"):
+                conf += 5
+            if len((candidate.get("snippet") or "").strip()) > 30:
+                conf += 3
+            if candidate.get("candidate_status") == "Missing" and 0 < (candidate.get("best_match_score") or 0) < 70:
+                conf += 4
+            is_duplicate = candidate.get("best_match_url") in duplicate_urls
+            if not is_duplicate:
+                conf += 3
+            conf = min(15, conf)
+            strategic = category_stats[category]["strategic_score"]
+
+            penalties = 0
+            if candidate.get("geo_bucket") == "Unknown Location":
+                penalties += 25
+            if candidate.get("geo_bucket") == "Out of Scope":
+                penalties += 50
+            if is_duplicate:
+                penalties += 30
+            if candidate.get("candidate_status") == "Possible":
+                penalties += 10
+
+            score = max(0, min(100, visibility + demand + gap_score + conf + strategic - penalties))
+            reason = f"vis={visibility}, demand={demand}, gap={gap_score}, conf={conf}, strategic={strategic}, penalties={penalties}"
+            scored_rows.append({
+                "category": category,
+                "candidate_name": candidate.get("candidate_name", ""),
+                "opportunity_score": int(score),
+                "visibility_score": visibility,
+                "demand_score": demand,
+                "gap_score": gap_score,
+                "confidence_score": conf,
+                "strategic_score": strategic,
+                "penalties": penalties,
+                "reason": reason,
+                "best_source_query": sorted(candidate.get("queries", set()))[0] if candidate.get("queries") else candidate.get("source_query", ""),
+                "serp_rank": candidate.get("rank"),
+                "candidate_domain": candidate.get("domain", ""),
+                "location_status": candidate.get("geo_bucket", "In Scope"),
+                "candidate_status": candidate.get("candidate_status", "Missing"),
+                "gap_ratio": round(category_stats[category]["gap_ratio"], 3),
+                "is_duplicate": is_duplicate,
+            })
+
+    scored_rows.sort(key=lambda x: x["opportunity_score"], reverse=True)
+    summary_rows = []
+    for category in selected_categories:
+        rows = [r for r in scored_rows if r["category"] == category and r["candidate_status"] == "Missing"]
+        summary_rows.append({
+            "category": category,
+            "avg_score (missing)": round(sum(r["opportunity_score"] for r in rows) / max(1, len(rows)), 2),
+            "top_score": max([r["opportunity_score"] for r in rows], default=0),
+            "count_scored": len(rows),
+            "gap_ratio": round(category_stats[category]["gap_ratio"], 3),
+        })
+    debug_stats = {
+        "rows_scored": len(scored_rows),
+        "score_min": min([r["opportunity_score"] for r in scored_rows], default=0),
+        "score_mean": round(sum(r["opportunity_score"] for r in scored_rows) / max(1, len(scored_rows)), 2),
+        "score_max": max([r["opportunity_score"] for r in scored_rows], default=0),
+    }
+    return scored_rows, summary_rows, debug_stats
+
+
+def run_self_check() -> List[dict]:
+    inventory_df = pd.DataFrame([
+        {"url": "https://example.com/hotel-a", "category": "Hotels"},
+        {"url": "https://example.com/food-a", "category": "Restaurants"},
+        {"url": "https://example.com/food-b", "category": "Restaurants"},
+    ])
+    hotels_df, _ = get_inventory_for_category("Hotels", inventory_df, {"inventory_category_field": "category", "inventory_categories": ["hotels"]})
+    restaurants_df, _ = get_inventory_for_category("Restaurants", inventory_df, {"inventory_category_field": "category", "inventory_categories": ["restaurants"]})
+    score_rows, _, _ = build_milestone3_scores({"Hotels": {"candidates": [{"id": 1}], "missing": [{"candidate_name": "X", "rank": 2, "queries": {"best hotels"}, "website": "https://x.com", "snippet": "great hotel great hotel great hotel great hotel", "geo_bucket": "Unknown Location"}], "possible": [], "duplicates": ([], [], 0)}}, ["Hotels"], {"Hotels": {"strategic_weight": 1.0}}, False)
+    return [
+        {"check": "inventory_counts_differ", "passed": len(hotels_df) != len(restaurants_df)},
+        {"check": "score_within_bounds", "passed": bool(score_rows) and 0 <= score_rows[0]["opportunity_score"] <= 100},
+        {"check": "unknown_location_penalty_applied", "passed": bool(score_rows) and score_rows[0]["penalties"] >= 25},
+    ]
 
 
 def _clean_text(text: str) -> str:
@@ -946,13 +1183,34 @@ def render_serp_gap_page() -> None:
         st.error(f"Failed to load inventory: {err}")
         return
 
+    inventory_df = pd.DataFrame([asdict(row) for row in inventory_rows])
     results_by_category: Dict[str, dict] = {}
+    inventory_counts: List[int] = []
+    missing_category_mapping_count = 0
+
     for category in selected_categories:
         cfg = category_config.get(category, {})
+        category_inventory_df, inventory_report = get_inventory_for_category(category, inventory_df, cfg)
+        category_inventory = [UrlRow(**row) for row in category_inventory_df.to_dict(orient="records")]
+        inventory_counts.append(len(category_inventory))
+        if not inventory_report.get("inventory_filter_field_used"):
+            missing_category_mapping_count += 1
+            _append_debug(debug_log, f"WARNING {category} inventory has no usable category field. per-category inventory count forced to 0")
+
+        _append_debug(debug_log, (
+            f"{category} inventory_total_rows={inventory_report['inventory_total_rows']} "
+            f"inventory_rows_for_category={inventory_report['inventory_rows_for_category']} "
+            f"inventory_filter_field_used={inventory_report['inventory_filter_field_used']} "
+            f"inventory_filter_labels_used={inventory_report['inventory_filter_labels_used']} "
+            f"inventory_filter_strategy={inventory_report['inventory_filter_strategy']} "
+            f"fallback={inventory_report['fallback']} reason={inventory_report['reason']}"
+        ))
+
         queries = build_query_seeds(destination, region, cfg, custom_query_seeds)
         if not queries:
-            results_by_category[category] = {"inventory_rows": category_inventory_rows(inventory_rows, cfg), "candidates": [], "in_scope": [], "missing": [], "possible": [], "listed": [], "out_scope": [], "unknown": [], "duplicates": ([], [], 0)}
+            results_by_category[category] = {"inventory_rows": category_inventory, "candidates": [], "in_scope": [], "missing": [], "possible": [], "listed": [], "out_scope": [], "unknown": [], "duplicates": ([], [], 0)}
             continue
+
         raw_candidates: List[dict] = []
         for query in queries:
             for page_idx in range(int(organic_pages)):
@@ -978,7 +1236,6 @@ def render_serp_gap_page() -> None:
         in_scope, out_scope, unknown = apply_geo_filter(candidates, destination, strict_city_match, allowed_cities)
         _append_debug(debug_log, f"{category} geo_stats total={len(candidates)} in_scope={len(in_scope)} out_scope={len(out_scope)} unknown={len(unknown)}")
 
-        category_inventory = category_inventory_rows(inventory_rows, cfg)
         inventory_entities = build_inventory_entities(category_inventory, destination, region, country, cfg)
         missing, possible, listed = score_and_partition(in_scope, inventory_entities, int(fuzzy_threshold))
         dup_clusters, dup_members, dup_scanned = detect_duplicates(inventory_rows, destination, region, cfg)
@@ -994,6 +1251,11 @@ def render_serp_gap_page() -> None:
             "unknown": unknown,
             "duplicates": (dup_clusters, dup_members, dup_scanned),
         }
+
+    if len(set(inventory_counts)) == 1 and inventory_counts and inventory_counts[0] > 0:
+        st.warning("All category inventory counts are identical. Category-to-inventory mapping may not be applied.")
+    if len(inventory_rows) > 0 and sum(inventory_counts) > len(inventory_rows) * 1.2:
+        _append_debug(debug_log, "Multi-category inventory detected; counts may overlap.")
 
     matrix_rows = []
     for category in selected_categories:
@@ -1063,9 +1325,73 @@ def render_serp_gap_page() -> None:
                 st.download_button(f"Download {category} Duplicate Clusters CSV", data=rows_to_csv_bytes(clusters), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_duplicate_clusters.csv", mime="text/csv")
                 st.download_button(f"Download {category} Duplicate Members CSV", data=rows_to_csv_bytes(members), file_name=f"vacayrank_{category.lower().replace(' ', '_')}_duplicate_members.csv", mime="text/csv")
 
+    st.subheader("Milestone 3 — Opportunities")
+    self_check = st.button("Run Milestone 3 self-check")
+    if self_check:
+        st.dataframe(run_self_check(), use_container_width=True)
+
+    include_possible = st.checkbox("Include Possible candidates", value=False)
+    min_score = st.slider("Minimum opportunity score", min_value=0, max_value=100, value=35)
+    exclude_unknown = st.checkbox("Exclude Unknown Location", value=True)
+    exclude_oos = st.checkbox("Exclude Out of Scope", value=True)
+    exclude_dupes = st.checkbox("Exclude Duplicates", value=True)
+    category_filter = st.selectbox("Category filter", options=["All"] + selected_categories, index=0)
+
+    cache_parts = {
+        "destination": destination,
+        "region": region,
+        "country": country,
+        "allowed_cities": sorted(list(allowed_cities)),
+        "strict_city_match": bool(strict_city_match),
+        "selected_categories": selected_categories,
+        "category_config_hash": _stable_key(json.dumps(category_config, sort_keys=True)),
+        "fuzzy_threshold": int(fuzzy_threshold),
+        "cache_ttl_hours": float(cache_hours),
+        "include_possible": bool(include_possible),
+    }
+    m3_payload = None if force_refresh else load_milestone3_disk_cache(cache_parts, float(cache_hours))
+    if m3_payload is None:
+        scored_rows, summary_rows, m3_debug = build_milestone3_scores(results_by_category, selected_categories, category_config, include_possible)
+        save_milestone3_disk_cache(cache_parts, {"scored_rows": scored_rows, "summary_rows": summary_rows, "debug": m3_debug})
+    else:
+        scored_rows = m3_payload.get("scored_rows", [])
+        summary_rows = m3_payload.get("summary_rows", [])
+        m3_debug = m3_payload.get("debug", {})
+
+    filtered_rows = []
+    excluded_unknown = excluded_oos = excluded_dupes = 0
+    for row in scored_rows:
+        if category_filter != "All" and row["category"] != category_filter:
+            continue
+        if row["opportunity_score"] < min_score:
+            continue
+        if exclude_unknown and row.get("location_status") == "Unknown Location":
+            excluded_unknown += 1
+            continue
+        if exclude_oos and row.get("location_status") == "Out of Scope":
+            excluded_oos += 1
+            continue
+        if exclude_dupes and row.get("is_duplicate"):
+            excluded_dupes += 1
+            continue
+        filtered_rows.append(row)
+
+    display_cols = ["category", "candidate_name", "opportunity_score", "visibility_score", "demand_score", "gap_score", "confidence_score", "strategic_score", "penalties", "reason", "best_source_query", "serp_rank", "candidate_domain", "location_status"]
+    st.write("Top Opportunities")
+    st.dataframe([{k: row.get(k) for k in display_cols} for row in filtered_rows], use_container_width=True, height=320)
+    st.download_button("Download CSV: top opportunities", data=rows_to_csv_bytes([{k: row.get(k) for k in display_cols} for row in filtered_rows]), file_name="vacayrank_milestone3_top_opportunities.csv", mime="text/csv")
+
+    st.write("Per-Category Opportunity Summary")
+    st.dataframe(summary_rows, use_container_width=True, height=220)
+    st.download_button("Download CSV: per-category opportunity summary", data=rows_to_csv_bytes(summary_rows), file_name="vacayrank_milestone3_summary.csv", mime="text/csv")
+
     if show_debug_log:
+        _append_debug(debug_log, f"Milestone3 scoring inputs summary rows={len(scored_rows)} include_possible={include_possible} category_filter={category_filter} min_score={min_score}")
+        _append_debug(debug_log, f"Milestone3 score ranges min/mean/max={m3_debug.get('score_min', 0)}/{m3_debug.get('score_mean', 0)}/{m3_debug.get('score_max', 0)}")
+        _append_debug(debug_log, f"Milestone3 excluded counts unknown={excluded_unknown} out_of_scope={excluded_oos} duplicates={excluded_dupes} missing_mapping_categories={missing_category_mapping_count}")
         st.subheader("Debug log")
         st.code("\n".join(debug_log) if debug_log else "No debug entries.", language="text")
+
 
 
 def main() -> None:
