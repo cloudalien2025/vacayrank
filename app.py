@@ -12,7 +12,15 @@ import streamlit as st
 from bd_copilot import evaluate_rules, load_bd_core
 from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
-from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache, load_inventory_progress
+from inventory_engine import (
+    InventoryBundle,
+    build_canonical_member_set,
+    cache_inventory_to_disk,
+    fetch_inventory_index,
+    inventory_to_csv,
+    load_inventory_from_cache,
+    load_inventory_progress,
+)
 from milestone3.bd_client import BDClient
 from serp_gap_engine import run_serp_gap_analysis
 from structural_audit_engine import run_structural_audit
@@ -37,6 +45,8 @@ if "run_audit_log" not in st.session_state:
     st.session_state.run_audit_log = []
 if "inventory_fetch_in_progress" not in st.session_state:
     st.session_state.inventory_fetch_in_progress = False
+if "canonical_members" not in st.session_state:
+    st.session_state.canonical_members = {}
 
 with st.sidebar:
     st.header("API Settings")
@@ -107,6 +117,7 @@ with tab_inventory:
         else:
             st.session_state.inventory_fetch_in_progress = True
             try:
+                st.session_state.canonical_members = {}
                 progress = load_inventory_progress(PROGRESS_PATH)
                 active_fingerprint = inventory_fingerprint(client.base_url, int(page_size))
                 progress_fingerprint = progress.get("fingerprint", {}) if progress else {}
@@ -139,6 +150,7 @@ with tab_inventory:
                     progress_path=PROGRESS_PATH,
                 )
                 st.session_state.inventory_bundle = bundle
+                st.session_state.canonical_members = build_canonical_member_set(bundle.records)
                 cache_inventory_to_disk(
                     bundle,
                     CACHE_PATH,
@@ -174,11 +186,13 @@ with tab_inventory:
     if col3.button("Load cached inventory"):
         if Path(CACHE_PATH).exists():
             st.session_state.inventory_bundle = load_inventory_from_cache(CACHE_PATH)
+            st.session_state.canonical_members = build_canonical_member_set(st.session_state.inventory_bundle.records)
         else:
             st.warning("No cache file found")
 
     if col4.button("Clear inventory"):
         st.session_state.inventory_bundle = None
+        st.session_state.canonical_members = {}
         for target_path in (Path(CACHE_PATH), Path(PROGRESS_PATH)):
             if target_path.exists():
                 target_path.unlink()
@@ -188,8 +202,10 @@ with tab_inventory:
         if bundle.status == "partial":
             resume_page = (bundle.meta or {}).get("resume_from_page")
             st.warning(f"Rate limited; resume from page {resume_page} after cooldown" if resume_page else "Rate limited; resume supported")
-        unique_user_ids = {str(row.get("user_id", "")).strip() for row in bundle.records if str(row.get("user_id", "")).strip()}
-        st.metric("Total members (API inventory)", len(unique_user_ids))
+        canonical_members = st.session_state.get("canonical_members") or build_canonical_member_set(bundle.records)
+        st.session_state.canonical_members = canonical_members
+        canonical_records = list(canonical_members.values())
+        st.metric("Total members (API inventory)", len(canonical_members))
         run_meta = bundle.meta or {}
         st.caption(
             "New members added this run: "
@@ -207,7 +223,7 @@ with tab_inventory:
         c3, c4 = st.columns(2)
         c3.dataframe(pd.DataFrame(bundle.summary.get("status_distribution", {}).items(), columns=["member_status", "count"]))
         c4.dataframe(pd.DataFrame(bundle.summary.get("membership_plan_distribution", {}).items(), columns=["member_plan", "count"]))
-        st.download_button("Export Member Inventory CSV", data=inventory_to_csv(bundle.records), file_name="member_inventory_api_index.csv", mime="text/csv")
+        st.download_button("Export Member Inventory CSV", data=inventory_to_csv(canonical_records), file_name="member_inventory_api_index.csv", mime="text/csv")
 
     st.markdown("### API Evidence Panel")
     if st.session_state.api_evidence:
