@@ -10,7 +10,15 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import pandas as pd
 
-from milestone3.bd_client import BDClient, BDClientError
+from milestone3.bd_client import BDClient, BDClientError, BDResponse
+
+__all__ = [
+    "InventoryBundle",
+    "fetch_inventory_index",
+    "load_inventory_from_cache",
+    "cache_inventory_to_disk",
+    "inventory_to_csv",
+]
 
 
 @dataclass
@@ -74,38 +82,73 @@ def normalize_user(user: Dict[str, Any], base_url: str = "") -> Dict[str, Any]:
     }
 
 
-def normalize_records(payload: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _decode_presentation_fields(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Placeholder for future UI decode pass (URL encoded values, etc).
+    return records
+
+
+def _normalize_records(payload: Any) -> tuple[List[Dict[str, Any]], List[str], str]:
     parse_errors: List[str] = []
+    bd_status = ""
 
     if isinstance(payload, list):
-        return payload, parse_errors
+        return payload, parse_errors, bd_status
 
     if isinstance(payload, dict):
-        status = payload.get("status")
-        if status is not None and str(status).lower() != "success":
-            parse_errors.append(f"BD status not success: {status}")
+        bd_status = str(payload.get("status", "") or "")
+        if bd_status and bd_status.lower() != "success":
+            detail_parts = [bd_status]
+            for key in ("message", "error"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    detail_parts.append(value.strip())
+            parse_errors.append("BD status not success: " + " | ".join(detail_parts))
 
-        candidate_rows = None
-        for key in ("message", "data", "results", "users"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                candidate_rows = value
-                break
+        if isinstance(payload.get("message"), list):
+            return payload["message"], parse_errors, bd_status
+        if isinstance(payload.get("data"), list):
+            return payload["data"], parse_errors, bd_status
+        return [], parse_errors, bd_status
 
-        if candidate_rows is not None:
-            if len(candidate_rows) == 0 and str(status).lower() == "success":
-                parse_errors.append("BD returned success but no records in expected keys (message/data).")
-            return candidate_rows, parse_errors
+    return [], ["Unexpected payload shape from /api/v2/user/search"], bd_status
 
-        if str(status).lower() == "success":
-            parse_errors.append("BD returned success but no records in expected keys (message/data).")
 
-        message = payload.get("error") or payload.get("message")
-        if isinstance(message, str) and message.strip():
-            parse_errors.append(f"BD payload message: {message.strip()}")
-        return [], parse_errors
+def _apply_response_classification(response: BDResponse, client: BDClient) -> None:
+    if not client.evidence_log:
+        return
 
-    raise BDClientError("Unexpected payload shape from /api/v2/user/search")
+    content_type = (response.content_type or "").lower()
+    snippet = (response.text or "")[:500]
+    lower_snippet = snippet.lower()
+    evidence = client.evidence_log[-1]
+
+    if response.status_code == 403 and ("cloudflare" in lower_snippet or "attention required" in lower_snippet):
+        evidence["error_type"] = "CLOUDFLARE_BLOCK"
+        evidence["action_hint"] = "Cloudflare custom rule blocking non-human browsers; exclude /api/"
+        client.annotate_last_evidence(parse_error="CLOUDFLARE_BLOCK")
+        return
+
+    if response.status_code in {401, 403}:
+        evidence["error_type"] = "AUTH_FORBIDDEN"
+        client.annotate_last_evidence(parse_error="AUTH_FORBIDDEN")
+        return
+
+    if response.status_code == 200 and ("text/html" in content_type or response.text.lstrip().startswith("<")):
+        evidence["error_type"] = "BD_HTML_RESPONSE"
+        evidence["action_hint"] = "Ensure output_type=array; verify endpoint/method"
+        client.annotate_last_evidence(parse_error="BD_HTML_RESPONSE")
+
+
+def _update_last_evidence_parse(client: BDClient, *, records_parsed: int, bd_status: str, parse_errors: List[str], payload: Any) -> None:
+    client.annotate_last_evidence(records_parsed=records_parsed)
+    if not client.evidence_log:
+        return
+    evidence = client.evidence_log[-1]
+    if bd_status:
+        evidence["bd_status"] = bd_status
+    evidence["response_json_type"] = type(payload).__name__
+    for parse_error in parse_errors:
+        client.annotate_last_evidence(records_parsed=records_parsed, parse_error=parse_error)
 
 
 def fetch_inventory_index(
@@ -118,26 +161,20 @@ def fetch_inventory_index(
     for page in range(1, max_pages + 1):
         payload = {"output_type": "array", "page": page, "limit": page_size}
         response = client.search_users(payload)
-        content_type = (response.content_type or "").lower()
-        is_html = "text/html" in content_type or response.text.lstrip().startswith("<")
-        if is_html:
-            client.annotate_last_evidence(parse_error="HTML response detected; output_type=array missing or endpoint returned HTML")
-            raise BDClientError("Brilliant Directories returned HTML instead of JSON. Ensure output_type=array is present.")
+        _apply_response_classification(response, client)
+
         if not response.ok:
-            client.annotate_last_evidence(parse_error=f"HTTP {response.status_code}")
             raise BDClientError(f"Inventory fetch failed with HTTP {response.status_code}")
 
-        try:
-            rows, parse_errors = normalize_records(response.json_data)
-        except Exception as exc:
-            client.annotate_last_evidence(parse_error=f"JSON parse error: {exc}")
-            raise
+        if response.status_code == 200 and (
+            "text/html" in (response.content_type or "").lower() or response.text.lstrip().startswith("<")
+        ):
+            raise BDClientError("Brilliant Directories returned HTML instead of JSON. Ensure endpoint and output_type=array.")
 
-        normalized = [normalize_user(row, client.base_url) for row in rows]
+        rows, parse_errors, bd_status = _normalize_records(response.json_data)
+        normalized = _decode_presentation_fields([normalize_user(row, client.base_url) for row in rows])
         records.extend(normalized)
-        client.annotate_last_evidence(records_parsed=len(rows))
-        for parse_error in parse_errors:
-            client.annotate_last_evidence(records_parsed=len(rows), parse_error=parse_error)
+        _update_last_evidence_parse(client, records_parsed=len(rows), bd_status=bd_status, parse_errors=parse_errors, payload=response.json_data)
 
         if len(rows) == 0:
             break

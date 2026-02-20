@@ -4,15 +4,16 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
 
+from bd_copilot import evaluate_rules, load_bd_core
 from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
-from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache, normalize_records
-from milestone3.bd_client import BDClient, BDClientError
+from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache
+from milestone3.bd_client import BDClient
 from serp_gap_engine import run_serp_gap_analysis
 from structural_audit_engine import run_structural_audit
 
@@ -48,6 +49,7 @@ normalized_base_url = base_url.strip().rstrip("/")
 client = BDClient(base_url=normalized_base_url, api_key=api_key)
 write_engine = SafeWriteEngine(client)
 
+
 def sync_evidence() -> None:
     st.session_state.api_evidence = list(client.evidence_log)
 
@@ -68,14 +70,17 @@ def append_run_audit(action: str, records_fetched: int, pages_fetched: int, outc
     )
 
 
-tab_inventory, tab_audit, tab_serp, tab_write, tab_log = st.tabs(
-    ["Inventory (API Index)", "Structural Audit", "SERP Gap Analysis", "Write Queue", "Audit Log"]
+tab_inventory, tab_copilot, tab_audit, tab_serp, tab_write, tab_log = st.tabs(
+    ["Inventory (API Index)", "BD Co-Pilot", "Structural Audit", "SERP Gap Analysis", "Write Queue", "Audit Log"]
 )
 
 with tab_inventory:
     st.subheader("Milestone 1 — API Member Inventory")
     if st.button("Resolve BD Base URL"):
         resolved_base = client.resolve_base_url()
+        if client.evidence_log:
+            client.evidence_log[-1]["base_url"] = normalized_base_url
+            client.evidence_log[-1]["resolved_base_url"] = resolved_base
         sync_evidence()
         st.info(f"Resolved base URL: {resolved_base}")
 
@@ -102,20 +107,8 @@ with tab_inventory:
 
     if col2.button("Single Page Test"):
         try:
-            payload = {"output_type": "array", "page": 1, "limit": int(page_size)}
-            response = client.search_users(payload, label="M1 Single Page Test")
-            content_type = (response.content_type or "").lower()
-            if "text/html" in content_type or response.text.lstrip().startswith("<"):
-                client.annotate_last_evidence(parse_error="HTML response detected; output_type=array missing or endpoint returned HTML")
-                raise BDClientError("Single page test returned HTML. output_type=array may be missing or ignored.")
-            if not response.ok:
-                client.annotate_last_evidence(parse_error=f"HTTP {response.status_code}")
-                raise BDClientError(f"Single page test failed with HTTP {response.status_code}")
-            parsed, parse_errors = normalize_records(response.json_data)
-            parsed_count = len(parsed)
-            client.annotate_last_evidence(records_parsed=parsed_count)
-            for parse_error in parse_errors:
-                client.annotate_last_evidence(records_parsed=parsed_count, parse_error=parse_error)
+            single_page_bundle = fetch_inventory_index(client, page_size=int(page_size), max_pages=1, delay_seconds=0)
+            parsed_count = len(single_page_bundle.records)
             append_run_audit("M1 Single Page Test", parsed_count, 1, "success")
             st.success(f"Single page parsed records: {parsed_count}")
         except Exception as exc:
@@ -151,6 +144,54 @@ with tab_inventory:
         st.json(st.session_state.api_evidence[-1])
     else:
         st.info("No API evidence yet.")
+
+with tab_copilot:
+    st.subheader("BD Co-Pilot — Intelligence Schema v1")
+    try:
+        bd_core = load_bd_core()
+        st.caption(
+            f"Schema {bd_core['version'].get('schema_version')} · KB {bd_core['version'].get('kb_version')} · Updated {bd_core['version'].get('updated_at')}"
+        )
+
+        latest_evidence = st.session_state.api_evidence[-1] if st.session_state.api_evidence else {}
+        if latest_evidence:
+            findings = evaluate_rules(latest_evidence, bd_core["rules"], bd_core["playbooks"])
+            grouped = {"blocker": [], "warn": [], "info": []}
+            for finding in findings:
+                grouped.setdefault(finding.get("severity", "info"), []).append(finding)
+
+            for severity in ["blocker", "warn", "info"]:
+                items = grouped.get(severity, [])
+                if not items:
+                    continue
+                st.markdown(f"### {severity.upper()}")
+                for item in items:
+                    st.markdown(f"**{item['id']}** — {item['title']}")
+                    if item.get("recommended_actions"):
+                        st.write("Recommended actions:")
+                        for action in item["recommended_actions"]:
+                            st.markdown(f"- {action}")
+                    playbook = item.get("playbook") or {}
+                    if playbook.get("steps"):
+                        st.write(f"Playbook: {playbook.get('title', playbook.get('id', 'N/A'))}")
+                        for step in playbook["steps"]:
+                            st.markdown(f"  - {step}")
+
+            debug_bundle = {
+                "evidence": latest_evidence,
+                "findings": findings,
+                "versions": bd_core["version"],
+            }
+            st.download_button(
+                "Export Debug Bundle",
+                data=json.dumps(debug_bundle, indent=2),
+                file_name="bd_copilot_debug_bundle.json",
+                mime="application/json",
+            )
+        else:
+            st.info("No API evidence yet. Run Single Page Test or Inventory Fetch first.")
+    except Exception as exc:
+        st.error(f"Unable to load BD Co-Pilot files: {exc}")
 
 with tab_audit:
     st.subheader("Milestone 2.5 — BD Structural Audit")

@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0.0",
+  "title": "BD_Core Intelligence Schema v1",
+  "entity_types": {
+    "facts": {
+      "required_fields": ["id", "title", "statement", "status", "confidence", "last_verified", "provenance"],
+      "optional_fields": ["tags", "endpoint", "method", "request_encoding", "response_shape"]
+    },
+    "doctrine": {
+      "required_fields": ["id", "title", "principle", "status", "confidence", "last_verified", "provenance"],
+      "optional_fields": ["enforcement"]
+    },
+    "signals": {
+      "required_fields": ["id", "title", "pattern", "status", "confidence", "last_verified", "provenance"],
+      "optional_fields": ["example"]
+    },
+    "rules": {
+      "required_fields": ["id", "title", "trigger", "conditions", "classification", "severity", "recommended_actions", "playbook_ref", "status", "confidence", "last_verified", "provenance"],
+      "optional_fields": ["notes"]
+    },
+    "playbooks": {
+      "required_fields": ["id", "title", "steps", "status", "confidence", "last_verified", "provenance"],
+      "optional_fields": ["when_to_use"]
+    }
+  },
+  "provenance_model": {
+    "required_fields": ["source", "confidence", "last_verified"],
+    "allowed_status": ["proposed", "active", "deprecated"],
+    "confidence_range": [0, 1]
+  },
+  "versioning": {
+    "schema_version_field": "schema_version",
+    "kb_version_field": "kb_version"
+  }
+}

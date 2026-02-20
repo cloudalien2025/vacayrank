@@ -1,0 +1,67 @@
+{
+  "kb_version": "1.0.0",
+  "playbooks": [
+    {
+      "id": "PLAYBOOK_FIX_CLOUDFLARE_API_BLOCK",
+      "title": "Fix Cloudflare blocking BD API",
+      "when_to_use": "403 plus Cloudflare/Attention Required signatures",
+      "steps": [
+        "Open Cloudflare WAF custom rules for the zone.",
+        "Locate rules targeting Non-Human Browsers or strict UA fingerprints.",
+        "Add path exclusion for /api/* before browser-only checks.",
+        "Deploy rule changes and re-run Single Page Test.",
+        "Confirm evidence shows status_code=200 and application/json."
+      ],
+      "status": "active",
+      "confidence": 0.98,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "VacayRank production remediation", "confidence": 0.98, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "PLAYBOOK_FIX_BD_WRAPPER_PARSING",
+      "title": "Fix BD API parsing for wrappers/html anomalies",
+      "when_to_use": "message[] wrapper, data[] wrapper, or HTML API response",
+      "steps": [
+        "Ensure requests include output_type=array and correct endpoint path.",
+        "Normalize response payload as list OR dict.message[] OR dict.data[].",
+        "Record bd_status and records_parsed in evidence.",
+        "If records_parsed==0, emit explicit warning (no silent empty).",
+        "Decode URL-encoded field values for UI/export readability if needed."
+      ],
+      "status": "active",
+      "confidence": 0.96,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Observed endpoint behavior", "confidence": 0.96, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "PLAYBOOK_FIX_AUTH_FORBIDDEN",
+      "title": "Fix auth-related 401/403 without Cloudflare",
+      "when_to_use": "status is 401/403 and Cloudflare signature absent",
+      "steps": [
+        "Validate X-Api-Key value and environment secret wiring.",
+        "Confirm key scope/permissions in BD admin.",
+        "Retest using /api/v2/user/search with form-urlencoded POST.",
+        "Rotate key if compromise or expiration is suspected."
+      ],
+      "status": "active",
+      "confidence": 0.95,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Operational checklist", "confidence": 0.95, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "PLAYBOOK_FIX_BASE_URL_REDIRECT",
+      "title": "Fix base URL redirect/header-drop risk",
+      "when_to_use": "resolved base URL differs from configured base URL",
+      "steps": [
+        "Run base URL resolve and capture canonical destination.",
+        "Persist resolved base URL for all API calls.",
+        "Re-run API probe and compare evidence before/after.",
+        "Validate headers are present after canonicalization."
+      ],
+      "status": "active",
+      "confidence": 0.9,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Observed redirect behavior", "confidence": 0.9, "last_verified": "2026-02-20"}
+    }
+  ]
+}
