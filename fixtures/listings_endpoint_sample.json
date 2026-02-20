@@ -1,0 +1,13 @@
+{
+  "status": "success",
+  "message": [
+    {
+      "group_id": 99,
+      "group_name": "Sample Listing",
+      "group_filename": "sample-listing",
+      "user_id": 42,
+      "data_id": 75,
+      "post_location": "Vail, CO"
+    }
+  ]
+}

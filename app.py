@@ -24,6 +24,15 @@ from inventory_engine import (
 from milestone3.bd_client import BDClient
 from serp_gap_engine import run_serp_gap_analysis
 from structural_audit_engine import run_structural_audit
+from listings_inventory_engine import (
+    build_listings_via_scrape,
+    clear_listings_inventory_cache,
+    fetch_listings_via_api,
+    listings_to_csv,
+    load_audit_rows,
+    load_listings_inventory,
+    probe_listings_endpoints,
+)
 
 CACHE_PATH = "cache/inventory_index.json"
 PROGRESS_PATH = "cache/inventory_progress.json"
@@ -47,6 +56,10 @@ if "inventory_fetch_in_progress" not in st.session_state:
     st.session_state.inventory_fetch_in_progress = False
 if "canonical_members" not in st.session_state:
     st.session_state.canonical_members = {}
+if "listings_inventory" not in st.session_state:
+    st.session_state.listings_inventory = load_listings_inventory()
+if "listings_endpoint_decision" not in st.session_state:
+    st.session_state.listings_endpoint_decision = None
 
 with st.sidebar:
     st.header("API Settings")
@@ -94,8 +107,8 @@ def append_run_audit(action: str, records_fetched: int, pages_fetched: int, outc
     )
 
 
-tab_inventory, tab_copilot, tab_audit, tab_serp, tab_write, tab_log = st.tabs(
-    ["Inventory (API Index)", "BD Co-Pilot", "Structural Audit", "SERP Gap Analysis", "Write Queue", "Audit Log"]
+tab_inventory, tab_listings, tab_copilot, tab_audit, tab_serp, tab_write, tab_log = st.tabs(
+    ["Inventory (API Index)", "Listings Inventory (Discovery)", "BD Co-Pilot", "Structural Audit", "SERP Gap Analysis", "Write Queue", "Audit Log"]
 )
 
 with tab_inventory:
@@ -242,6 +255,78 @@ with tab_inventory:
         st.json(st.session_state.api_evidence[-1])
     else:
         st.info("No API evidence yet.")
+
+
+with tab_listings:
+    st.subheader("Listings Inventory (Discovery)")
+    seed_url = st.text_input("Seed URL", value=f"{client.base_url}/listings")
+    listings_limit = st.number_input("Listings page size", min_value=1, max_value=200, value=100, step=1)
+    listings_max_pages = st.number_input("Listings max pages per run", min_value=1, max_value=500, value=40, step=1)
+    listings_rpm = st.slider("Listings Requests/Minute", min_value=5, max_value=120, value=30, step=1)
+
+    b1, b2, b3, b4, b5 = st.columns(5)
+    if b1.button("Probe API for Listings Endpoints"):
+        decision = probe_listings_endpoints(client, dry_run=dry_run)
+        st.session_state.listings_endpoint_decision = decision
+        inventory = st.session_state.listings_inventory or {}
+        inventory["selected_endpoint"] = decision.selected_endpoint
+        st.session_state.listings_inventory = inventory
+
+    endpoint = (st.session_state.listings_endpoint_decision.selected_endpoint if st.session_state.listings_endpoint_decision else None)
+
+    if b2.button("Fetch Listings (API)", disabled=endpoint is None):
+        try:
+            result = fetch_listings_via_api(
+                client,
+                endpoint=endpoint,
+                page_limit=int(listings_limit),
+                max_pages=int(listings_max_pages),
+                rpm=int(listings_rpm),
+                dry_run=dry_run,
+            )
+            st.session_state.listings_inventory = {"records": result.records, "selected_endpoint": endpoint}
+        except Exception as exc:
+            st.error(str(exc))
+
+    if b3.button("Build Listings (Scrape Fallback)"):
+        result = build_listings_via_scrape(client, seed_url=seed_url, max_pages=int(listings_max_pages), rpm=int(listings_rpm))
+        st.session_state.listings_inventory = {"records": result.records, "selected_endpoint": None}
+
+    if b4.button("Clear Listings Inventory"):
+        clear_listings_inventory_cache()
+        st.session_state.listings_inventory = {"records": [], "selected_endpoint": None}
+        st.session_state.listings_endpoint_decision = None
+
+    listings_records = (st.session_state.listings_inventory or {}).get("records", [])
+    if b5.download_button("Export Listings CSV", data=listings_to_csv(listings_records), file_name="listings_inventory.csv", mime="text/csv"):
+        pass
+
+    st.metric("Total Listings (unique)", len(listings_records))
+    if listings_records:
+        listings_df = pd.DataFrame(listings_records)
+        st.dataframe(listings_df.head(25))
+        cat_col, geo_col = st.columns(2)
+        cat_col.dataframe(listings_df["category"].fillna("Unknown").value_counts().reset_index(name="count").rename(columns={"index": "category"}))
+        listings_df["geo_key"] = listings_df[["city", "state", "country"]].fillna("").agg(", ".join, axis=1).str.strip(", ").replace("", "Unknown")
+        geo_col.dataframe(listings_df["geo_key"].value_counts().reset_index(name="count").rename(columns={"index": "geo"}))
+
+    st.markdown("### Endpoint Decision")
+    decision = st.session_state.listings_endpoint_decision
+    if decision:
+        st.json({
+            "selected_endpoint": decision.selected_endpoint,
+            "why_accepted": decision.accepted_reason,
+            "why_rejected": decision.rejected_reasons[-10:],
+        })
+    else:
+        st.info("No endpoint decision yet.")
+
+    st.markdown("### Evidence Panel")
+    audit_rows = load_audit_rows()
+    if audit_rows:
+        st.dataframe(pd.DataFrame(audit_rows))
+    else:
+        st.info("No listings evidence yet.")
 
 with tab_copilot:
     st.subheader("BD Co-Pilot — Intelligence Schema v1")
