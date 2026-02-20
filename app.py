@@ -11,7 +11,7 @@ import streamlit as st
 
 from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
-from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache
+from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache, normalize_records
 from milestone3.bd_client import BDClient, BDClientError
 from serp_gap_engine import run_serp_gap_analysis
 from structural_audit_engine import run_structural_audit
@@ -111,9 +111,11 @@ with tab_inventory:
             if not response.ok:
                 client.annotate_last_evidence(parse_error=f"HTTP {response.status_code}")
                 raise BDClientError(f"Single page test failed with HTTP {response.status_code}")
-            parsed = response.json_data if isinstance(response.json_data, list) else response.json_data.get("data", [])
-            parsed_count = len(parsed) if isinstance(parsed, list) else 0
+            parsed, parse_errors = normalize_records(response.json_data)
+            parsed_count = len(parsed)
             client.annotate_last_evidence(records_parsed=parsed_count)
+            for parse_error in parse_errors:
+                client.annotate_last_evidence(records_parsed=parsed_count, parse_error=parse_error)
             append_run_audit("M1 Single Page Test", parsed_count, 1, "success")
             st.success(f"Single page parsed records: {parsed_count}")
         except Exception as exc:
