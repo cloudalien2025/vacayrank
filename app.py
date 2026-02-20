@@ -12,12 +12,13 @@ import streamlit as st
 from bd_copilot import evaluate_rules, load_bd_core
 from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
-from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache
+from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache, load_inventory_progress
 from milestone3.bd_client import BDClient
 from serp_gap_engine import run_serp_gap_analysis
 from structural_audit_engine import run_structural_audit
 
 CACHE_PATH = "cache/inventory_index.json"
+PROGRESS_PATH = "cache/inventory_progress.json"
 
 st.set_page_config(page_title="VacayRank BD-Native", layout="wide")
 st.title("VacayRank — BD-Native Milestones 1-3")
@@ -34,6 +35,8 @@ if "api_evidence" not in st.session_state:
     st.session_state.api_evidence = []
 if "run_audit_log" not in st.session_state:
     st.session_state.run_audit_log = []
+if "inventory_fetch_in_progress" not in st.session_state:
+    st.session_state.inventory_fetch_in_progress = False
 
 with st.sidebar:
     st.header("API Settings")
@@ -43,7 +46,10 @@ with st.sidebar:
     dry_run = st.toggle("Dry Run", value=True)
     typed_confirm = st.text_input("Typed Confirm", value="")
     page_size = st.number_input("Inventory page size", min_value=1, max_value=200, value=100, step=1)
-    max_pages = st.number_input("Inventory max pages", min_value=1, max_value=500, value=200, step=1)
+    inventory_max_pages = st.number_input("Inventory max pages", min_value=1, max_value=500, value=200, step=1)
+    inventory_rpm = st.slider("Inventory Requests/Minute", min_value=5, max_value=120, value=30, step=1)
+    max_pages_per_run = st.number_input("Max pages per run", min_value=1, max_value=int(inventory_max_pages), value=min(20, int(inventory_max_pages)), step=1)
+    resume_mode = st.toggle("Resume from last page if progress exists", value=True)
 
 normalized_base_url = base_url.strip().rstrip("/")
 client = BDClient(base_url=normalized_base_url, api_key=api_key)
@@ -88,26 +94,48 @@ with tab_inventory:
 
     col1, col2, col3, col4 = st.columns(4)
     if col1.button("Fetch from /api/v2/user/search"):
-        try:
-            bundle = fetch_inventory_index(client, page_size=int(page_size), max_pages=int(max_pages))
-            st.session_state.inventory_bundle = bundle
-            cache_inventory_to_disk(
-                bundle,
-                CACHE_PATH,
-                base_url_used=client.base_url,
-                payload_defaults={"output_type": "array", "limit": int(page_size)},
-            )
-            pages_fetched = sum(1 for x in client.evidence_log if x.get("label") == "M1 Inventory Fetch")
-            append_run_audit("M1 Inventory Fetch", len(bundle.records), pages_fetched, "success")
-        except Exception as exc:
-            append_run_audit("M1 Inventory Fetch", 0, 0, f"error: {exc}")
-            st.error(str(exc))
-        finally:
-            sync_evidence()
+        if st.session_state.inventory_fetch_in_progress:
+            st.warning("Inventory fetch is already in progress. Please wait for it to finish.")
+        else:
+            st.session_state.inventory_fetch_in_progress = True
+            try:
+                progress = load_inventory_progress(PROGRESS_PATH) if resume_mode else {}
+                start_page = int(progress.get("last_page", 0)) + 1 if progress else 1
+                if start_page > 1:
+                    st.info(f"Resuming inventory fetch from page {start_page}.")
+                bundle = fetch_inventory_index(
+                    client,
+                    page_size=int(page_size),
+                    max_pages=int(max_pages_per_run),
+                    requests_per_minute=int(inventory_rpm),
+                    start_page=start_page,
+                    cache_path=CACHE_PATH,
+                    progress_path=PROGRESS_PATH,
+                )
+                st.session_state.inventory_bundle = bundle
+                cache_inventory_to_disk(
+                    bundle,
+                    CACHE_PATH,
+                    base_url_used=client.base_url,
+                    payload_defaults={"output_type": "array", "limit": int(page_size)},
+                )
+                pages_fetched = sum(1 for x in client.evidence_log if x.get("label") == "M1 Inventory Fetch")
+                outcome = "partial" if bundle.status == "partial" else "success"
+                append_run_audit("M1 Inventory Fetch", len(bundle.records), pages_fetched, outcome)
+                if bundle.status == "partial" and (bundle.meta or {}).get("error_type") == "RATE_LIMIT":
+                    st.error("Rate limited by BD API (HTTP 429). Cooldown and resume supported.")
+                    st.write("Next actions: reduce rpm slider, reduce page batch size, wait and press Resume/Continue.")
+                    st.info((bundle.meta or {}).get("message", "Rate limited; resume available."))
+            except Exception as exc:
+                append_run_audit("M1 Inventory Fetch", 0, 0, f"error: {exc}")
+                st.error(str(exc))
+            finally:
+                st.session_state.inventory_fetch_in_progress = False
+                sync_evidence()
 
     if col2.button("Single Page Test"):
         try:
-            single_page_bundle = fetch_inventory_index(client, page_size=int(page_size), max_pages=1, delay_seconds=0)
+            single_page_bundle = fetch_inventory_index(client, page_size=int(page_size), max_pages=1, requests_per_minute=int(inventory_rpm), start_page=1)
             parsed_count = len(single_page_bundle.records)
             append_run_audit("M1 Single Page Test", parsed_count, 1, "success")
             st.success(f"Single page parsed records: {parsed_count}")
@@ -125,9 +153,14 @@ with tab_inventory:
 
     if col4.button("Clear inventory"):
         st.session_state.inventory_bundle = None
+        if Path(PROGRESS_PATH).exists():
+            Path(PROGRESS_PATH).unlink()
 
     bundle: InventoryBundle | None = st.session_state.inventory_bundle
     if bundle:
+        if bundle.status == "partial":
+            resume_page = (bundle.meta or {}).get("resume_from_page")
+            st.warning(f"Rate limited; resume from page {resume_page} after cooldown" if resume_page else "Rate limited; resume supported")
         st.metric("Total members (API inventory)", bundle.summary.get("total_members", 0))
         c1, c2 = st.columns(2)
         c1.dataframe(pd.DataFrame(bundle.summary.get("by_category", {}).items(), columns=["member_category", "count"]))
@@ -141,6 +174,16 @@ with tab_inventory:
     if st.session_state.api_evidence:
         evidence_df = pd.DataFrame(st.session_state.api_evidence)
         st.dataframe(evidence_df)
+        rate_limit_rows = [e for e in st.session_state.api_evidence if int(e.get("status_code", 0) or 0) == 429]
+        if rate_limit_rows:
+            first_429_time = rate_limit_rows[0].get("timestamp", "")
+            total_429s = len(rate_limit_rows)
+            suggested_rpm = max(20, min(30, int(inventory_rpm * 0.75)))
+            st.markdown("#### Rate Limit Summary")
+            s1, s2, s3 = st.columns(3)
+            s1.metric("First 429 Time", first_429_time or "n/a")
+            s2.metric("Total 429s", total_429s)
+            s3.metric("Suggested RPM", suggested_rpm)
         st.json(st.session_state.api_evidence[-1])
     else:
         st.info("No API evidence yet.")

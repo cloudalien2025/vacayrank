@@ -18,6 +18,7 @@ class BDResponse:
     json_data: Dict[str, Any]
     text: str
     content_type: str
+    headers: Dict[str, str]
 
 
 class BDClient:
@@ -95,6 +96,7 @@ class BDClient:
             json_data=payload,
             text=response.text,
             content_type=getattr(response, "headers", {}).get("Content-Type", ""),
+            headers=dict(getattr(response, "headers", {}) or {}),
         )
 
     def _request(

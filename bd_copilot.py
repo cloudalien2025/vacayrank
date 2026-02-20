@@ -59,6 +59,11 @@ def evaluate_rules(evidence: Dict[str, Any], rules_doc: Dict[str, Any], playbook
             matched = records_parsed == 0 and len(parse_errors) == 0
         elif rid == "URLENCODED_FIELDS_PRESENT":
             matched = has_encoded
+        elif rid == "RATE_LIMIT_DETECT":
+            matched = status_code == 429 or "too many api requests" in snippet_lower
+            if matched and int(evidence.get("attempt_no", 1) or 1) >= 3:
+                rule = dict(rule)
+                rule["severity"] = "blocker"
 
         if matched:
             playbook = playbooks.get(rule.get("playbook_ref"), {})

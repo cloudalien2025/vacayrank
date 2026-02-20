@@ -10,7 +10,11 @@
       "status": "active",
       "confidence": 0.99,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Observed in VacayRank Evidence Panel", "confidence": 0.99, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Observed in VacayRank Evidence Panel",
+        "confidence": 0.99,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_API_FORM_URLENCODED",
@@ -20,7 +24,11 @@
       "status": "active",
       "confidence": 0.98,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Milestone3 client implementation and tests", "confidence": 0.98, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Milestone3 client implementation and tests",
+        "confidence": 0.98,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_OUTPUT_TYPE_ARRAY",
@@ -29,17 +37,29 @@
       "status": "active",
       "confidence": 0.94,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "BD docs + observed behavior", "confidence": 0.94, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "BD docs + observed behavior",
+        "confidence": 0.94,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_RESPONSE_LIST_OR_WRAPPER",
       "title": "Search response shape",
       "statement": "Search response may be a list or wrapper dict with status/message[].",
-      "response_shape": ["list", "dict.status+message[]", "dict.data[]"],
+      "response_shape": [
+        "list",
+        "dict.status+message[]",
+        "dict.data[]"
+      ],
       "status": "active",
       "confidence": 0.97,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Observed in VacayRank Evidence Panel", "confidence": 0.97, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Observed in VacayRank Evidence Panel",
+        "confidence": 0.97,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_CLOUDFLARE_SIGNATURE",
@@ -48,7 +68,11 @@
       "status": "active",
       "confidence": 0.99,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Observed with 403 payloads", "confidence": 0.99, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Observed with 403 payloads",
+        "confidence": 0.99,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_NON_HUMAN_BROWSER_RULE",
@@ -57,7 +81,11 @@
       "status": "active",
       "confidence": 0.95,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Cloudflare rule diagnostics", "confidence": 0.95, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Cloudflare rule diagnostics",
+        "confidence": 0.95,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_API_EXEMPTION",
@@ -66,7 +94,11 @@
       "status": "active",
       "confidence": 0.95,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Verified remediation in deployment", "confidence": 0.95, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Verified remediation in deployment",
+        "confidence": 0.95,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_HTML_200_IS_ANOMALY",
@@ -75,7 +107,11 @@
       "status": "active",
       "confidence": 0.93,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Observed parsing failures", "confidence": 0.93, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Observed parsing failures",
+        "confidence": 0.93,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_EVIDENCE_FIRST",
@@ -84,7 +120,11 @@
       "status": "active",
       "confidence": 1.0,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "BD_Core doctrine", "confidence": 1.0, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "BD_Core doctrine",
+        "confidence": 1.0,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_DRY_RUN_DEFAULT",
@@ -93,7 +133,11 @@
       "status": "active",
       "confidence": 1.0,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Product doctrine", "confidence": 1.0, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Product doctrine",
+        "confidence": 1.0,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_REDIRECT_RISK",
@@ -102,7 +146,11 @@
       "status": "active",
       "confidence": 0.9,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Operational troubleshooting", "confidence": 0.9, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Operational troubleshooting",
+        "confidence": 0.9,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "FACT_URLENCODED_DISPLAY",
@@ -111,7 +159,37 @@
       "status": "active",
       "confidence": 0.88,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Observed exported fields", "confidence": 0.88, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Observed exported fields",
+        "confidence": 0.88,
+        "last_verified": "2026-02-20"
+      }
+    },
+    {
+      "id": "FACT_BD_RATE_LIMITS",
+      "title": "BD API can rate limit per minute",
+      "statement": "BD API may enforce per-minute request limits and return HTTP 429.",
+      "status": "active",
+      "confidence": 0.98,
+      "last_verified": "2026-02-20",
+      "provenance": {
+        "source": "Observed /api/v2/user/search evidence",
+        "confidence": 0.98,
+        "last_verified": "2026-02-20"
+      }
+    },
+    {
+      "id": "FACT_RATE_LIMIT_MITIGATION",
+      "title": "Mitigate with pacing, batching, and resume",
+      "statement": "Recommended mitigation is request pacing plus page batching with resumable progress checkpoints.",
+      "status": "active",
+      "confidence": 0.97,
+      "last_verified": "2026-02-20",
+      "provenance": {
+        "source": "VacayRank inventory engine controls",
+        "confidence": 0.97,
+        "last_verified": "2026-02-20"
+      }
     }
   ],
   "doctrine": [
@@ -122,7 +200,11 @@
       "status": "active",
       "confidence": 1.0,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Product doctrine", "confidence": 1.0, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Product doctrine",
+        "confidence": 1.0,
+        "last_verified": "2026-02-20"
+      }
     }
   ],
   "signals": [
@@ -133,7 +215,11 @@
       "status": "active",
       "confidence": 0.99,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Evidence snapshots", "confidence": 0.99, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Evidence snapshots",
+        "confidence": 0.99,
+        "last_verified": "2026-02-20"
+      }
     }
   ]
 }
