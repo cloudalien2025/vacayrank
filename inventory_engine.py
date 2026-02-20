@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 import pandas as pd
 
-from milestone3.bd_client import BDClient
+from milestone3.bd_client import BDClient, BDClientError
 
 
 @dataclass
@@ -51,6 +53,8 @@ def normalize_user(user: Dict[str, Any], base_url: str = "") -> Dict[str, Any]:
 
     return {
         "user_id": user.get("user_id") or user.get("id"),
+        "email": _first_non_empty(user, ("email",)),
+        "name": _first_non_empty(user, ("name", "full_name", "business_name", "company", "listing_name")),
         "business_name": _first_non_empty(user, ("business_name", "company", "name", "listing_name")),
         "primary_category": primary_category,
         "secondary_categories": secondary_categories,
@@ -59,7 +63,7 @@ def normalize_user(user: Dict[str, Any], base_url: str = "") -> Dict[str, Any]:
         "country": country,
         "location": ", ".join([x for x in [city, state, country] if x]),
         "service_areas": service_areas,
-        "membership_plan": _first_non_empty(user, ("membership_plan", "plan", "subscription_name", "subscription_id")),
+        "plan": _first_non_empty(user, ("membership_plan", "plan", "subscription_name", "subscription_id")),
         "status": active_status,
         "slug": slug,
         "profile_url": profile_url,
@@ -70,21 +74,49 @@ def normalize_user(user: Dict[str, Any], base_url: str = "") -> Dict[str, Any]:
     }
 
 
-def fetch_inventory_index(client: BDClient, page_size: int = 200, max_pages: int = 200) -> InventoryBundle:
+def _parse_user_rows(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        rows = data.get("data") or data.get("users") or data.get("results") or []
+        if isinstance(rows, list):
+            return rows
+    raise BDClientError("Unexpected payload shape from /api/v2/user/search")
+
+
+def fetch_inventory_index(
+    client: BDClient,
+    page_size: int = 100,
+    max_pages: int = 200,
+    delay_seconds: float = 0.15,
+) -> InventoryBundle:
     records: List[Dict[str, Any]] = []
     for page in range(1, max_pages + 1):
-        payload = {"page": page, "per_page": page_size}
+        payload = {"output_type": "array", "page": page, "limit": page_size}
         response = client.search_users(payload)
+        content_type = (response.content_type or "").lower()
+        is_html = "text/html" in content_type or response.text.lstrip().startswith("<")
+        if is_html:
+            client.annotate_last_evidence(parse_error="HTML response detected; output_type=array missing or endpoint returned HTML")
+            raise BDClientError("Brilliant Directories returned HTML instead of JSON. Ensure output_type=array is present.")
         if not response.ok:
-            break
-        data = response.json_data
-        rows = data.get("data") or data.get("users") or data.get("results") or []
-        if not rows:
-            break
+            client.annotate_last_evidence(parse_error=f"HTTP {response.status_code}")
+            raise BDClientError(f"Inventory fetch failed with HTTP {response.status_code}")
+
+        try:
+            rows = _parse_user_rows(response.json_data)
+        except Exception as exc:
+            client.annotate_last_evidence(parse_error=f"JSON parse error: {exc}")
+            raise
+
         normalized = [normalize_user(row, client.base_url) for row in rows]
         records.extend(normalized)
-        if len(rows) < page_size:
+        client.annotate_last_evidence(records_parsed=len(rows))
+
+        if len(rows) == 0:
             break
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
 
     inventory_index: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     cat_counter: Counter[str] = Counter()
@@ -99,10 +131,10 @@ def fetch_inventory_index(client: BDClient, page_size: int = 200, max_pages: int
         cat_counter[row["primary_category"] or "Uncategorized"] += 1
         geo_counter[row["location"] or "Unknown"] += 1
         status_counter[row["status"]] += 1
-        plan_counter[row["membership_plan"] or "Unknown"] += 1
+        plan_counter[row["plan"] or "Unknown"] += 1
 
     summary = {
-        "total_listings": len(records),
+        "total_members": len(records),
         "by_category": dict(cat_counter),
         "by_geo": dict(geo_counter),
         "status_distribution": dict(status_counter),
@@ -111,8 +143,15 @@ def fetch_inventory_index(client: BDClient, page_size: int = 200, max_pages: int
     return InventoryBundle(records=records, inventory_index=dict(inventory_index), summary=summary)
 
 
-def cache_inventory_to_disk(bundle: InventoryBundle, path: str) -> None:
+def cache_inventory_to_disk(bundle: InventoryBundle, path: str, *, base_url_used: str = "", payload_defaults: Dict[str, Any] | None = None) -> None:
     payload = {
+        "metadata": {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "base_url_used": base_url_used,
+            "endpoint": "/api/v2/user/search",
+            "payload_defaults": payload_defaults or {"output_type": "array", "limit": 100},
+            "total_records": len(bundle.records),
+        },
         "records": bundle.records,
         "summary": bundle.summary,
         "inventory_index": {f"{k[0]}|||{k[1]}": v for k, v in bundle.inventory_index.items()},
@@ -138,4 +177,6 @@ def inventory_to_csv(records: List[Dict[str, Any]]) -> str:
     if not records:
         return ""
     frame = pd.DataFrame(records).drop(columns=["raw"], errors="ignore")
-    return frame.to_csv(index=False)
+    preferred = ["user_id", "email", "name", "status", "plan", "profile_url"]
+    ordered = [column for column in preferred if column in frame.columns] + [column for column in frame.columns if column not in preferred]
+    return frame[ordered].to_csv(index=False)
