@@ -12,6 +12,7 @@ import streamlit as st
 from bd_copilot import evaluate_rules, load_bd_core
 from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
+import listings_inventory_engine as lie
 from inventory_engine import (
     InventoryBundle,
     build_canonical_member_set,
@@ -22,21 +23,29 @@ from inventory_engine import (
     load_inventory_progress,
 )
 from milestone3.bd_client import BDClient
-from serp_gap_engine import run_serp_gap_analysis
+import serp_gap_engine as sge
 from structural_audit_engine import run_structural_audit
-from listings_inventory_engine import (
-    build_listings_via_scrape,
-    clear_listings_inventory_cache,
-    fetch_listings_via_api,
-    listings_to_csv,
-    load_audit_rows,
-    load_listings_inventory,
-    load_listings_progress,
-    probe_listings_endpoints,
-)
 
 CACHE_PATH = "cache/inventory_index.json"
 PROGRESS_PATH = "cache/inventory_progress.json"
+
+
+def _missing_engine_fn(module_name: str, func_name: str):
+    def _missing(*_args, **_kwargs):
+        raise RuntimeError(f"{module_name}.{func_name} is unavailable in this deployment")
+
+    return _missing
+
+
+build_listings_via_scrape = getattr(lie, "build_listings_via_scrape", _missing_engine_fn("listings_inventory_engine", "build_listings_via_scrape"))
+clear_listings_inventory_cache = getattr(lie, "clear_listings_inventory_cache", _missing_engine_fn("listings_inventory_engine", "clear_listings_inventory_cache"))
+fetch_listings_via_api = getattr(lie, "fetch_listings_via_api", _missing_engine_fn("listings_inventory_engine", "fetch_listings_via_api"))
+listings_to_csv = getattr(lie, "listings_to_csv", _missing_engine_fn("listings_inventory_engine", "listings_to_csv"))
+load_audit_rows = getattr(lie, "load_audit_rows", _missing_engine_fn("listings_inventory_engine", "load_audit_rows"))
+load_listings_inventory = getattr(lie, "load_listings_inventory", lambda: {"records": [], "selected_endpoint": None})
+load_listings_progress = getattr(lie, "load_listings_progress", lambda: {"last_completed_page": 0, "total_pages": 0, "total_posts": 0})
+probe_listings_endpoints = getattr(lie, "probe_listings_endpoints", _missing_engine_fn("listings_inventory_engine", "probe_listings_endpoints"))
+run_serp_gap_analysis = getattr(sge, "run_serp_gap_analysis", _missing_engine_fn("serp_gap_engine", "run_serp_gap_analysis"))
 
 st.set_page_config(page_title="VacayRank BD-Native", layout="wide")
 st.title("VacayRank — BD-Native Milestones 1-3")
