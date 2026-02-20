@@ -45,3 +45,29 @@ The `/api/v2/user/search` endpoint can return repeated member rows across pages.
 - Deduplicates by normalized `user_id` before counting/storing records.
 - Stops pagination immediately when a page adds no new unique members.
 - Stores a resume fingerprint (`base_url`, endpoint, page size, `output_type`) in progress state so stale cursors are not reused after config changes.
+
+## Listings Inventory (Discovery)
+
+The Streamlit app now includes a **Listings Inventory (Discovery)** tab with deterministic API discovery + scrape fallback.
+
+### Workflow
+1. **Probe API for Listings Endpoints**
+   - Probes a constrained endpoint list (`classified`, `portfolio`, `users_portfolio_groups`, etc.).
+   - Uses `X-Api-Key` only for auth.
+   - Uses form-encoded POST bodies (`application/x-www-form-urlencoded`) with `limit/page/output_type` keys.
+   - Accepts an endpoint only when a `200` response returns records with listing-like fields (`group_id`, `group_filename`, `group_name`, etc.).
+2. **Fetch Listings (API)**
+   - Enabled only after an endpoint is accepted.
+   - Pages results with rate limiting.
+   - Deduplicates listing rows by canonical key:
+     - `group_id`, else `user_id:group_filename`, else stable SHA1 hash.
+   - Detects bad pagination by aborting when first record key repeats for 3 consecutive pages.
+3. **Build Listings (Scrape Fallback)**
+   - If no endpoint is found, builds inventory from sitemap/listings page scraping.
+   - Extracts `data-userid`, `data-postid` (group candidate), listing title, and category breadcrumbs.
+
+### Storage and evidence
+- Inventory cache: `cache/listings_inventory.json`
+- Progress cache: `cache/listings_progress.json`
+- Audit log (append + capped): `cache/audit_log.jsonl`
+- UI includes endpoint decision details, total listings, category/geo counts, table preview, and CSV export.
