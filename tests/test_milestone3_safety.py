@@ -4,7 +4,7 @@ from unittest.mock import patch
 from milestone3.audit_log import AuditLog
 from milestone3.bd_client import BDClient
 from milestone3.patch_engine import compute_patch
-from milestone3.write_queue import enforce_max_writes_per_session
+from milestone3.write_queue import build_write_queue_from_m2, enforce_max_writes_per_session
 
 
 class FakeResponse:
@@ -54,6 +54,19 @@ class Milestone3SafetyTests(unittest.TestCase):
     def test_dry_run_style_guard_max_writes(self):
         self.assertTrue(enforce_max_writes_per_session(0, 1))
         self.assertFalse(enforce_max_writes_per_session(1, 1))
+
+    def test_build_write_queue_from_m2_schema(self):
+        import pandas as pd
+
+        missing = pd.DataFrame([{"category": "Hotels", "city": "Vail", "candidate_name": "A", "website": "https://a.com"}])
+        possible = pd.DataFrame([{"category": "Hotels", "city": "Vail", "candidate_name": "B", "website": "https://b.com", "best_match_user_id": 11}])
+        duplicates = [{"candidate_name": "C", "bd_user_ids": [1, 2, 3]}]
+        queue = build_write_queue_from_m2(pd.DataFrame([]), missing, possible, duplicates, {})
+        self.assertIn("missing", queue)
+        self.assertIn("possible_matches", queue)
+        self.assertIn("duplicates", queue)
+        self.assertEqual(queue["missing"][0]["status"], "pending")
+        self.assertEqual(queue["possible_matches"][0]["best_match_user_id"], 11)
 
 
 if __name__ == "__main__":

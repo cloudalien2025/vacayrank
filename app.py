@@ -18,6 +18,12 @@ import requests
 import streamlit as st
 import pandas as pd
 
+from modules.state import init_state
+from milestone3.bd_client import BDClient
+from milestone3.patch_engine import compute_patch, encode_form, human_diff_table
+from milestone3.verifier import verify_user_fields
+from milestone3.write_queue import build_write_queue_from_m2
+
 try:
     from rapidfuzz import fuzz
 
@@ -1050,17 +1056,18 @@ def detect_duplicates(rows: List[UrlRow], destination: str, region: str, categor
 
 
 def render_inventory_page() -> None:
+    vr_state = init_state()
     st.subheader("Milestone 1 — Inventory")
     with st.sidebar:
         st.header("Inventory Settings")
-        sitemap_index_url = st.text_input("Sitemap index URL", value="https://vailvacay.com/sitemap_index.xml").strip()
-        timeout_secs = st.number_input("HTTP timeout (seconds)", min_value=5, max_value=60, value=DEFAULT_TIMEOUT_SECS)
-        max_child_sitemaps = st.number_input("Max child sitemaps", min_value=1, max_value=500, value=150)
-        max_urls_per_child = st.number_input("Max URLs per child sitemap (0=no limit)", min_value=0, max_value=200000, value=0)
-        disk_cache_max_age_hours = st.number_input("Use disk cache if newer than (hours)", min_value=0.0, max_value=168.0, value=12.0)
-        force_refresh = st.checkbox("Force refresh (ignore disk cache)", value=False)
-        show_debug_log = st.checkbox("Show debug log", value=False)
-        run = st.button("Run inventory scan", type="primary")
+        sitemap_index_url = st.text_input("Sitemap index URL", value="https://vailvacay.com/sitemap_index.xml", key="m1_sitemap_index_url").strip()
+        timeout_secs = st.number_input("HTTP timeout (seconds)", min_value=5, max_value=60, value=DEFAULT_TIMEOUT_SECS, key="m1_timeout_secs")
+        max_child_sitemaps = st.number_input("Max child sitemaps", min_value=1, max_value=500, value=150, key="m1_max_child_sitemaps")
+        max_urls_per_child = st.number_input("Max URLs per child sitemap (0=no limit)", min_value=0, max_value=200000, value=0, key="m1_max_urls_per_child")
+        disk_cache_max_age_hours = st.number_input("Use disk cache if newer than (hours)", min_value=0.0, max_value=168.0, value=12.0, key="m1_cache_age")
+        force_refresh = st.checkbox("Force refresh (ignore disk cache)", value=False, key="m1_force_refresh")
+        show_debug_log = st.checkbox("Show debug log", value=False, key="m1_show_debug")
+        run = st.button("Run inventory scan", type="primary", key="m1_run")
 
     if not run:
         st.info("Configure settings in the sidebar, then click **Run inventory scan**.")
@@ -1076,6 +1083,16 @@ def render_inventory_page() -> None:
     st.metric("Inventory URLs", stats.urls_found)
     st.caption(f"Fetched at: {stats.fetched_at_utc} • Cache used: {'Yes' if stats.cache_used else 'No'} • Elapsed: {stats.elapsed_seconds}s")
     table = [{"url": r.url, "url_type": r.url_type, "source_sitemap": r.source_sitemap, "lastmod": r.lastmod or ""} for r in rows]
+    vr_state.inventory_df = pd.DataFrame(table)
+    vr_state.inventory_meta = {
+        "sitemap_index_url": stats.sitemap_index_url,
+        "fetched_at_utc": stats.fetched_at_utc,
+        "child_sitemaps_found": stats.child_sitemaps_found,
+        "child_sitemaps_fetched": stats.child_sitemaps_fetched,
+        "urls_found": stats.urls_found,
+        "elapsed_seconds": stats.elapsed_seconds,
+        "cache_used": stats.cache_used,
+    }
     st.dataframe(table, use_container_width=True, height=460)
     st.download_button("Download inventory CSV", data=rows_to_csv_bytes(table), file_name="vacayrank_inventory.csv", mime="text/csv")
     if show_debug_log:
@@ -1135,6 +1152,7 @@ def _display_candidate_rows(items: List[dict]) -> List[Dict[str, object]]:
 
 
 def render_serp_gap_page() -> None:
+    vr_state = init_state()
     st.subheader("Milestone 2 — SERP Gap")
     api_key = _extract_serp_api_key()
     category_config = _safe_category_config()
@@ -1142,26 +1160,26 @@ def render_serp_gap_page() -> None:
 
     with st.sidebar:
         st.header("SERP Gap Settings")
-        sitemap_index_url = st.text_input("Sitemap index URL", value="https://vailvacay.com/sitemap_index.xml").strip()
-        destination = st.text_input("Destination", value="Vail").strip()
-        region = st.text_input("Region/State", value="CO").strip()
-        country = st.text_input("Country", value="US").strip()
-        if st.button("Select all categories"):
+        sitemap_index_url = st.text_input("Sitemap index URL", value="https://vailvacay.com/sitemap_index.xml", key="m2_sitemap_index_url").strip()
+        destination = st.text_input("Destination", value="Vail", key="m2_destination").strip()
+        region = st.text_input("Region/State", value="CO", key="m2_region").strip()
+        country = st.text_input("Country", value="US", key="m2_country").strip()
+        if st.button("Select all categories", key="m2_select_all"):
             st.session_state["selected_categories"] = category_keys
-        selected_categories = st.multiselect("Categories to scan", options=category_keys, default=st.session_state.get("selected_categories", category_keys))
+        selected_categories = st.multiselect("Categories to scan", options=category_keys, default=st.session_state.get("selected_categories", category_keys), key="m2_selected_categories")
         st.session_state["selected_categories"] = selected_categories
-        custom_query_seeds = st.text_area("Custom query seeds (one per line, applies to all selected categories)", value="", height=120)
-        organic_pages = st.number_input("Organic pages to fetch", min_value=1, max_value=5, value=2)
-        maps_pages = st.number_input("Maps pages to fetch", min_value=1, max_value=5, value=2)
-        fuzzy_threshold = st.slider("Matching threshold", min_value=0, max_value=100, value=88)
-        cache_hours = st.number_input("Use disk cache if newer than (hours)", min_value=0.0, max_value=168.0, value=12.0)
-        force_refresh = st.checkbox("Force refresh", value=False)
-        show_debug_log = st.checkbox("Show debug log", value=False)
-        strict_city_match = st.checkbox("Strict city match", value=True)
-        allowed_cities_raw = st.text_input("Allowed cities (comma separated, optional)", value="")
-        use_location_targeting = st.checkbox("Use SerpAPI location targeting (advanced)", value=False)
+        custom_query_seeds = st.text_area("Custom query seeds (one per line, applies to all selected categories)", value="", height=120, key="m2_custom_query_seeds")
+        organic_pages = st.number_input("Organic pages to fetch", min_value=1, max_value=5, value=2, key="m2_organic_pages")
+        maps_pages = st.number_input("Maps pages to fetch", min_value=1, max_value=5, value=2, key="m2_maps_pages")
+        fuzzy_threshold = st.slider("Matching threshold", min_value=0, max_value=100, value=88, key="m2_fuzzy_threshold")
+        cache_hours = st.number_input("Use disk cache if newer than (hours)", min_value=0.0, max_value=168.0, value=12.0, key="m2_cache_hours")
+        force_refresh = st.checkbox("Force refresh", value=False, key="m2_force_refresh")
+        show_debug_log = st.checkbox("Show debug log", value=False, key="m2_show_debug")
+        strict_city_match = st.checkbox("Strict city match", value=True, key="m2_strict_city")
+        allowed_cities_raw = st.text_input("Allowed cities (comma separated, optional)", value="", key="m2_allowed_cities")
+        use_location_targeting = st.checkbox("Use SerpAPI location targeting (advanced)", value=False, key="m2_location_targeting")
         st.caption("Advanced location targeting is intentionally not used here; localization is query + gl/hl only.")
-        run = st.button("Run SERP Gap Scan", type="primary", disabled=not bool(api_key))
+        run = st.button("Run SERP Gap Scan", type="primary", disabled=not bool(api_key), key="m2_run")
 
     if not api_key:
         st.error("SERPAPI_API_KEY is missing. Set it in Streamlit secrets or environment variables to enable Milestone 2.")
@@ -1251,6 +1269,51 @@ def render_serp_gap_page() -> None:
             "unknown": unknown,
             "duplicates": (dup_clusters, dup_members, dup_scanned),
         }
+
+    missing_rows_all: List[dict] = []
+    possible_rows_all: List[dict] = []
+    duplicate_rows_all: List[dict] = []
+    for category in selected_categories:
+        result = results_by_category.get(category, {})
+        for row in result.get("missing", []):
+            missing_rows_all.append(
+                {
+                    "category_key": category,
+                    "city_key": destination,
+                    "candidate_name": row.get("candidate_name") or row.get("title") or "",
+                    "candidate_address": row.get("address") or "",
+                    "candidate_website": row.get("website") or "",
+                    "candidate_phone": row.get("phone") or "",
+                    "source_url": row.get("source_url") or row.get("link") or "",
+                    "match_score": row.get("candidate_score") or 0,
+                }
+            )
+        for row in result.get("possible", []):
+            possible_rows_all.append(
+                {
+                    "category_key": category,
+                    "city_key": destination,
+                    "candidate_name": row.get("candidate_name") or row.get("title") or "",
+                    "candidate_address": row.get("address") or "",
+                    "candidate_website": row.get("website") or "",
+                    "candidate_phone": row.get("phone") or "",
+                    "source_url": row.get("source_url") or row.get("link") or "",
+                    "match_score": row.get("best_match_score") or 0,
+                    "best_match_user_id": row.get("best_match_user_id"),
+                }
+            )
+        duplicate_rows_all.extend(result.get("duplicates", ([], [], 0))[0])
+
+    vr_state.serp_gap_df = pd.DataFrame(missing_rows_all)
+    vr_state.possible_matches_df = pd.DataFrame(possible_rows_all)
+    vr_state.duplicates_obj = duplicate_rows_all
+    vr_state.write_queue = build_write_queue_from_m2(
+        vr_state.inventory_df,
+        vr_state.serp_gap_df,
+        vr_state.possible_matches_df,
+        vr_state.duplicates_obj,
+        {"strict_city_geo_filter": strict_city_match},
+    )
 
     if len(set(inventory_counts)) == 1 and inventory_counts and inventory_counts[0] > 0:
         st.warning("All category inventory counts are identical. Category-to-inventory mapping may not be applied.")
@@ -1393,19 +1456,167 @@ def render_serp_gap_page() -> None:
         st.code("\n".join(debug_log) if debug_log else "No debug entries.", language="text")
 
 
+def _append_audit_entry(entry: Dict[str, object]) -> None:
+    vr_state = init_state()
+    vr_state.audit_log_entries.append(entry)
+
+
+def render_m3_write_queue(global_cfg: Dict[str, object]) -> None:
+    vr_state = init_state()
+    st.subheader("Milestone 3 — BD Write Queue")
+    if vr_state.serp_gap_df.empty and vr_state.possible_matches_df.empty and not vr_state.duplicates_obj:
+        st.warning("Run M2 to generate queue rows.")
+        return
+
+    client = BDClient(str(global_cfg["base_url"]), str(global_cfg["api_key"]))
+    queue_tabs = st.tabs(["Add Missing", "Fix Possible Matches", "Resolve Duplicates"])
+
+    with queue_tabs[0]:
+        for row in vr_state.write_queue.get("missing", []):
+            with st.expander(f"{row.get('candidate_name')} ({row.get('category_key')})"):
+                st.write({"address": row.get("candidate_address"), "website": row.get("candidate_website"), "score": row.get("match_score")})
+                if st.button("Preview Create", key=f"pcreate_{row['row_id']}"):
+                    payload = row.get("proposed_patch", {}).copy()
+                    payload.update({"email": f"{row['row_id']}@example.invalid", "password": "TempPass123!", "subscription_id": 1})
+                    st.code(f"POST /api/v2/user/create\n{encode_form(payload)}")
+                    _append_audit_entry({"action_type": "preview_create", "endpoint": "/api/v2/user/create", "payload_form_encoded": encode_form(payload), "source_row_id": row["row_id"], "dry_run": bool(global_cfg["dry_run"])})
+                    confirm = st.text_input("Type CONFIRM", key=f"ccreate_{row['row_id']}") if global_cfg["typed_confirm"] else "CONFIRM"
+                    if st.button("Commit Create", key=f"create_{row['row_id']}"):
+                        if confirm != "CONFIRM":
+                            st.error("Typed confirmation required.")
+                        elif global_cfg["dry_run"]:
+                            st.warning("Dry Run is ON; write blocked.")
+                        else:
+                            if vr_state.writes_committed_this_session >= int(global_cfg['max_writes']):
+                                st.error('Max writes per session reached.')
+                                continue
+                            resp = client.create_user(payload)
+                            vr_state.writes_committed_this_session += 1
+                            _append_audit_entry({"action_type": "create", "endpoint": "/api/v2/user/create", "payload_form_encoded": encode_form(payload), "http_status": resp.status_code, "response_json": resp.json_data, "source_row_id": row["row_id"], "dry_run": False})
+
+    with queue_tabs[1]:
+        for row in vr_state.write_queue.get("possible_matches", []):
+            with st.expander(f"{row.get('candidate_name')} score={row.get('match_score')}"):
+                user_id = int(row.get("best_match_user_id") or 0)
+                st.write(f"best_match_user_id: {user_id}")
+                if st.button("Preview Update", key=f"pupdate_{row['row_id']}"):
+                    if user_id <= 0:
+                        st.error("No valid best_match_user_id available.")
+                        continue
+                    current = client.get_user(user_id).json_data.get("data", {})
+                    patch = compute_patch(current, row.get("proposed_patch", {}), allow_clearing=bool(global_cfg["allow_clearing"]))
+                    payload = {"user_id": user_id, **patch}
+                    st.dataframe(pd.DataFrame(human_diff_table(current, patch)), use_container_width=True)
+                    st.code(f"PUT /api/v2/user/update\n{encode_form(payload)}")
+                    _append_audit_entry({"action_type": "preview_update", "endpoint": "/api/v2/user/update", "payload_form_encoded": encode_form(payload), "source_row_id": row["row_id"], "dry_run": bool(global_cfg["dry_run"])})
+                    confirm = st.text_input("Type CONFIRM", key=f"cupdate_{row['row_id']}") if global_cfg["typed_confirm"] else "CONFIRM"
+                    if st.button("Commit Update", key=f"update_{row['row_id']}"):
+                        if confirm != "CONFIRM":
+                            st.error("Typed confirmation required.")
+                        elif global_cfg["dry_run"]:
+                            st.warning("Dry Run is ON; write blocked.")
+                        else:
+                            if vr_state.writes_committed_this_session >= int(global_cfg['max_writes']):
+                                st.error('Max writes per session reached.')
+                                continue
+                            resp = client.update_user(payload)
+                            verify_status = "not_run"
+                            verify_details = {}
+                            if global_cfg["auto_verify"]:
+                                passed, verify_details, _ = verify_user_fields(client, user_id, patch)
+                                verify_status = "passed" if passed else "failed"
+                            vr_state.writes_committed_this_session += 1
+                            _append_audit_entry({"action_type": "update", "endpoint": "/api/v2/user/update", "payload_form_encoded": encode_form(payload), "http_status": resp.status_code, "response_json": resp.json_data, "verification_status": verify_status, "verification_details": verify_details, "user_id": user_id, "source_row_id": row["row_id"], "dry_run": False})
+
+    with queue_tabs[2]:
+        for row in vr_state.write_queue.get("duplicates", []):
+            with st.expander(f"{row.get('candidate_name')} duplicates"):
+                ids = row.get("bd_user_ids") or []
+                if not ids:
+                    st.info("No duplicate BD user IDs available.")
+                    continue
+                canonical_id = st.selectbox("Canonical user_id", ids, key=f"canon_{row['row_id']}")
+                for dup_id in [x for x in ids if x != canonical_id]:
+                    payload = {"user_id": dup_id, "active": 4}
+                    st.code(f"PUT /api/v2/user/update\n{encode_form(payload)}")
+                    _append_audit_entry({"action_type": "preview_deactivate", "endpoint": "/api/v2/user/update", "payload_form_encoded": encode_form(payload), "source_row_id": row["row_id"], "dry_run": bool(global_cfg["dry_run"])})
+                    confirm = st.text_input("Type CONFIRM", key=f"cdup_{row['row_id']}_{dup_id}") if global_cfg["typed_confirm"] else "CONFIRM"
+                    if st.button(f"Commit Deactivate {dup_id}", key=f"dup_{row['row_id']}_{dup_id}"):
+                        if confirm != "CONFIRM":
+                            st.error("Typed confirmation required.")
+                        elif global_cfg["dry_run"]:
+                            st.warning("Dry Run is ON; write blocked.")
+                        else:
+                            if vr_state.writes_committed_this_session >= int(global_cfg['max_writes']):
+                                st.error('Max writes per session reached.')
+                                continue
+                            resp = client.update_user(payload)
+                            verify_status = "not_run"
+                            verify_details = {}
+                            if global_cfg["auto_verify"]:
+                                passed, verify_details, _ = verify_user_fields(client, dup_id, {"active": 4})
+                                verify_status = "passed" if passed else "failed"
+                            vr_state.writes_committed_this_session += 1
+                            _append_audit_entry({"action_type": "deactivate", "endpoint": "/api/v2/user/update", "payload_form_encoded": encode_form(payload), "http_status": resp.status_code, "response_json": resp.json_data, "verification_status": verify_status, "verification_details": verify_details, "user_id": dup_id, "source_row_id": row["row_id"], "dry_run": False})
+
+
+def render_audit_log_tab() -> None:
+    vr_state = init_state()
+    st.subheader("Audit Log")
+    entries = list(reversed(vr_state.audit_log_entries))
+    st.dataframe(entries, use_container_width=True)
+    st.download_button("Download JSON", data=json.dumps(entries, indent=2), file_name="vacayrank_audit.json", mime="application/json")
+    csv_buf = io.StringIO()
+    if entries:
+        writer = csv.DictWriter(csv_buf, fieldnames=sorted({k for e in entries for k in e.keys()}))
+        writer.writeheader()
+        writer.writerows(entries)
+    st.download_button("Download CSV", data=csv_buf.getvalue(), file_name="vacayrank_audit.csv", mime="text/csv")
+
+
 
 def main() -> None:
+    init_state()
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.write("Milestone 1 provides sitemap inventory. Milestone 2 discovers SERP candidates, computes SERP gaps, and surfaces duplicates.")
+    st.write("Unified app for Milestones 1-3 with integrated Audit Log.")
 
     with st.sidebar:
-        page = st.radio("Navigation", options=["Milestone 1 — Inventory", "Milestone 2 — SERP Gap"])
+        st.header("BD Global Controls")
+        base_url = st.text_input("BD Base URL", value="https://example.com")
+        api_key = st.text_input("BD API Key", value="", type="password")
+        dry_run = st.checkbox("Dry Run Mode", value=True)
+        typed_confirm = st.checkbox("Require typed CONFIRM", value=True)
+        allow_clearing = st.checkbox("Allow clearing fields", value=False)
+        auto_verify = st.checkbox("Auto-verify after write", value=True)
+        max_writes = st.number_input("Max writes per session", min_value=1, max_value=200, value=10)
+        strict_city_geo_filter = st.checkbox("Strict City Geo Filter", value=True)
 
-    if page == "Milestone 1 — Inventory":
+    tab_m1, tab_m2, tab_m3, tab_audit = st.tabs([
+        "Milestone 1 — Inventory",
+        "Milestone 2 — SERP Gap Analysis",
+        "Milestone 3 — BD Write Queue",
+        "Audit Log",
+    ])
+    with tab_m1:
         render_inventory_page()
-    else:
+    with tab_m2:
         render_serp_gap_page()
+    with tab_m3:
+        render_m3_write_queue(
+            {
+                "base_url": base_url,
+                "api_key": api_key,
+                "dry_run": dry_run,
+                "typed_confirm": typed_confirm,
+                "allow_clearing": allow_clearing,
+                "auto_verify": auto_verify,
+                "max_writes": max_writes,
+                "strict_city_geo_filter": strict_city_geo_filter,
+            }
+        )
+    with tab_audit:
+        render_audit_log_tab()
 
 
 if __name__ == "__main__":
