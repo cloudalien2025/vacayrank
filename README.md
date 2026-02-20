@@ -38,3 +38,10 @@ Then click **Load Milestone 2 Artifacts**.
 - When auto-verify is enabled (default ON), each commit is verified by:
   - `GET /api/v2/user/get/{user_id}`
   - Expected patch fields are compared to actual values.
+
+## Milestone 1 inventory safeguards
+
+The `/api/v2/user/search` endpoint can return repeated member rows across pages. To keep inventory totals accurate, Milestone 1 now:
+- Deduplicates by normalized `user_id` before counting/storing records.
+- Stops pagination immediately when a page adds no new unique members.
+- Stores a resume fingerprint (`base_url`, endpoint, page size, `output_type`) in progress state so stale cursors are not reused after config changes.

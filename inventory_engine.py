@@ -64,6 +64,37 @@ class RateLimiter:
         return wait_s
 
 
+def _normalize_user_id(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _inventory_fingerprint(*, base_url: str, page_size: int, output_type: str = "array") -> Dict[str, Any]:
+    return {
+        "base_url": str(base_url or "").rstrip("/"),
+        "endpoint": "/api/v2/user/search",
+        "limit": int(page_size),
+        "output_type": str(output_type),
+    }
+
+
+def _extract_pagination_meta(payload: Any) -> Dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+
+    result: Dict[str, int] = {}
+    for key in ("total_pages", "current_page", "total"):
+        value = payload.get(key)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            result[key] = parsed
+    return result
+
+
 def _build_inventory_bundle(records: List[Dict[str, Any]], *, status: str = "complete", meta: Dict[str, Any] | None = None) -> InventoryBundle:
     inventory_index: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     cat_counter: Counter[str] = Counter()
@@ -72,13 +103,18 @@ def _build_inventory_bundle(records: List[Dict[str, Any]], *, status: str = "com
     plan_counter: Counter[str] = Counter()
 
     for row in records:
-        category = (row["primary_category"] or "Uncategorized").strip().lower()
-        geo = (row["location"] or "Unknown").strip().lower()
+        primary_category = str(row.get("primary_category") or "Uncategorized")
+        location = str(row.get("location") or "Unknown")
+        member_status = str(row.get("status") or "unknown")
+        plan = str(row.get("plan") or "Unknown")
+
+        category = primary_category.strip().lower()
+        geo = location.strip().lower()
         inventory_index[(category, geo)].append(row)
-        cat_counter[row["primary_category"] or "Uncategorized"] += 1
-        geo_counter[row["location"] or "Unknown"] += 1
-        status_counter[row["status"]] += 1
-        plan_counter[row["plan"] or "Unknown"] += 1
+        cat_counter[primary_category] += 1
+        geo_counter[location] += 1
+        status_counter[member_status] += 1
+        plan_counter[plan] += 1
 
     summary = {
         "total_members": len(records),
@@ -159,7 +195,14 @@ def _request_with_backoff(
     )
 
 
-def _write_inventory_progress(progress_path: Path, *, last_page: int, records: int) -> None:
+def _write_inventory_progress(
+    progress_path: Path,
+    *,
+    last_page: int,
+    records: int,
+    fingerprint: Dict[str, Any],
+    stats: Dict[str, Any] | None = None,
+) -> None:
     progress_path.parent.mkdir(parents=True, exist_ok=True)
     progress_path.write_text(
         json.dumps(
@@ -167,6 +210,8 @@ def _write_inventory_progress(progress_path: Path, *, last_page: int, records: i
                 "last_page": int(last_page),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "records": int(records),
+                "fingerprint": fingerprint,
+                "stats": stats or {},
             },
             indent=2,
         ),
@@ -330,10 +375,25 @@ def fetch_inventory_index(
     progress_path: str = "cache/inventory_progress.json",
 ) -> InventoryBundle:
     records: List[Dict[str, Any]] = []
+    records_by_user_id: Dict[str, Dict[str, Any]] = {}
+    pages_fetched = 0
+    duplicates_skipped = 0
+    new_members_added = 0
+    consecutive_pages_no_new = 0
+    stop_reason = "max pages reached"
+    pagination_meta: Dict[str, Any] = {}
+    fingerprint = _inventory_fingerprint(base_url=client.base_url, page_size=page_size)
     progress_file = Path(progress_path)
     if cache_path and Path(cache_path).exists():
         existing = load_inventory_from_cache(cache_path)
-        records = list(existing.records)
+        for row in existing.records:
+            user_id = _normalize_user_id(row.get("user_id"))
+            if not user_id:
+                continue
+            records_by_user_id[user_id] = row
+
+    records = list(records_by_user_id.values())
+    seen_user_ids = set(records_by_user_id.keys())
 
     limiter = RateLimiter(rpm=requests_per_minute)
     end_page = start_page + max_pages - 1
@@ -342,7 +402,18 @@ def fetch_inventory_index(
         try:
             response = _request_with_backoff(client, payload, limiter)
         except InventoryFetchRateLimited as exc:
-            _write_inventory_progress(progress_file, last_page=max(start_page - 1, page - 1), records=len(records))
+            _write_inventory_progress(
+                progress_file,
+                last_page=max(start_page - 1, page - 1),
+                records=len(records),
+                fingerprint=fingerprint,
+                stats={
+                    "pages_fetched": pages_fetched,
+                    "new_members_added": new_members_added,
+                    "duplicates_skipped": duplicates_skipped,
+                    "stopped_reason": "rate limited",
+                },
+            )
             partial_bundle = _build_inventory_bundle(
                 records,
                 status="partial",
@@ -353,6 +424,11 @@ def fetch_inventory_index(
                     "attempts": exc.attempts,
                     "retry_after_s": exc.retry_after,
                     "message": f"Rate limited; resume from page {page} after cooldown",
+                    "pages_fetched": pages_fetched,
+                    "new_members_added": new_members_added,
+                    "duplicates_skipped": duplicates_skipped,
+                    "stopped_reason": "rate limited",
+                    "fingerprint": fingerprint,
                 },
             )
             if cache_path:
@@ -370,32 +446,110 @@ def fetch_inventory_index(
 
         rows, parse_errors, bd_status = _normalize_records(response.json_data)
         normalized = _decode_presentation_fields([normalize_user(row, client.base_url) for row in rows])
-        records.extend(normalized)
+        pages_fetched += 1
+        page_new = 0
+        page_duplicates = 0
+        for row in normalized:
+            user_id = _normalize_user_id(row.get("user_id"))
+            if not user_id:
+                continue
+            row["user_id"] = user_id
+            if user_id in seen_user_ids:
+                page_duplicates += 1
+                continue
+            seen_user_ids.add(user_id)
+            records_by_user_id[user_id] = row
+            page_new += 1
+
+        duplicates_skipped += page_duplicates
+        new_members_added += page_new
+        records = list(records_by_user_id.values())
         _update_last_evidence_parse(client, records_parsed=len(rows), bd_status=bd_status, parse_errors=parse_errors, payload=response.json_data)
 
+        if client.evidence_log:
+            evidence = client.evidence_log[-1]
+            evidence["page_new_members"] = page_new
+            evidence["page_duplicates_skipped"] = page_duplicates
+
+        pagination_meta = _extract_pagination_meta(response.json_data)
+
         if len(rows) == 0:
+            stop_reason = "empty page"
             break
-        _write_inventory_progress(progress_file, last_page=page, records=len(records))
+
+        if page_new == 0:
+            consecutive_pages_no_new += 1
+            stop_reason = "no new unique members"
+        else:
+            consecutive_pages_no_new = 0
+
+        _write_inventory_progress(
+            progress_file,
+            last_page=page,
+            records=len(records),
+            fingerprint=fingerprint,
+            stats={
+                "pages_fetched": pages_fetched,
+                "new_members_added": new_members_added,
+                "duplicates_skipped": duplicates_skipped,
+                "stopped_reason": stop_reason,
+            },
+        )
         if cache_path:
             cache_inventory_to_disk(_build_inventory_bundle(records), cache_path)
+
+        total_pages = pagination_meta.get("total_pages")
+        if total_pages and page >= total_pages:
+            stop_reason = "reached total_pages"
+            break
+
+        current_page = pagination_meta.get("current_page")
+        if current_page and current_page != page:
+            stop_reason = "current_page mismatch"
+            break
+
+        if consecutive_pages_no_new >= 1:
+            break
+
         if delay_seconds > 0:
             time.sleep(delay_seconds)
-    return _build_inventory_bundle(records)
+
+    return _build_inventory_bundle(
+        records,
+        meta={
+            "pages_fetched": pages_fetched,
+            "new_members_added": new_members_added,
+            "duplicates_skipped": duplicates_skipped,
+            "stopped_reason": stop_reason,
+            "fingerprint": fingerprint,
+            "last_page": page if pages_fetched else max(0, start_page - 1),
+            **pagination_meta,
+        },
+    )
 
 
 def cache_inventory_to_disk(bundle: InventoryBundle, path: str, *, base_url_used: str = "", payload_defaults: Dict[str, Any] | None = None) -> None:
+    unique_records: Dict[str, Dict[str, Any]] = {}
+    for row in bundle.records:
+        user_id = _normalize_user_id(row.get("user_id"))
+        if not user_id:
+            continue
+        row["user_id"] = user_id
+        unique_records[user_id] = row
+
+    ordered_records = list(unique_records.values())
     payload = {
         "metadata": {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "base_url_used": base_url_used,
             "endpoint": "/api/v2/user/search",
             "payload_defaults": payload_defaults or {"output_type": "array", "limit": 100},
-            "total_records": len(bundle.records),
+            "total_records": len(ordered_records),
             "status": bundle.status,
             "meta": bundle.meta or {},
         },
-        "records": bundle.records,
-        "summary": bundle.summary,
+        "records": ordered_records,
+        "summary": {**(bundle.summary or {}), "total_members": len(ordered_records)},
         "inventory_index": {f"{k[0]}|||{k[1]}": v for k, v in bundle.inventory_index.items()},
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -404,14 +558,29 @@ def cache_inventory_to_disk(bundle: InventoryBundle, path: str, *, base_url_used
 
 def load_inventory_from_cache(path: str) -> InventoryBundle:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    records_payload = payload.get("records", [])
+    records_by_user_id: Dict[str, Dict[str, Any]] = {}
+    for row in records_payload:
+        if not isinstance(row, dict):
+            continue
+        user_id = _normalize_user_id(row.get("user_id"))
+        if not user_id:
+            continue
+        row["user_id"] = user_id
+        records_by_user_id[user_id] = row
+
+    records = list(records_by_user_id.values())
+    recalculated_bundle = _build_inventory_bundle(records)
     inventory_index = {}
     for key, value in payload.get("inventory_index", {}).items():
         category, geo = key.split("|||", 1)
         inventory_index[(category, geo)] = value
+    if not inventory_index:
+        inventory_index = recalculated_bundle.inventory_index
     return InventoryBundle(
-        records=payload.get("records", []),
+        records=records,
         inventory_index=inventory_index,
-        summary=payload.get("summary", {}),
+        summary=payload.get("summary", {}) or recalculated_bundle.summary,
         status=(payload.get("metadata", {}) or {}).get("status", "complete"),
         meta=(payload.get("metadata", {}) or {}).get("meta", {}),
     )
