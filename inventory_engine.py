@@ -19,8 +19,10 @@ __all__ = [
     "InventoryBundle",
     "fetch_inventory_index",
     "load_inventory_from_cache",
+    "load_inventory_progress",
     "cache_inventory_to_disk",
     "inventory_to_csv",
+    "normalize_records",
 ]
 
 
@@ -265,6 +267,18 @@ def _normalize_records(payload: Any) -> tuple[List[Dict[str, Any]], List[str], s
         return [], parse_errors, bd_status
 
     return [], ["Unexpected payload shape from /api/v2/user/search"], bd_status
+
+
+def normalize_records(payload: Any) -> List[Dict[str, Any]]:
+    """Backwards-compatible public record normalization API.
+
+    Historically callers imported ``normalize_records`` directly from this module.
+    Keep this wrapper stable while internal parsing continues to live in
+    ``_normalize_records``.
+    """
+
+    rows, _, _ = _normalize_records(payload)
+    return rows
 
 
 def _apply_response_classification(response: BDResponse, client: BDClient) -> None:
