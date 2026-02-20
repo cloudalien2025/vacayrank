@@ -209,3 +209,17 @@ class BDClient:
 
     def delete_user(self, payload: Dict[str, Any]) -> BDResponse:
         return self.request_delete_form("/api/v2/user/delete", payload, label="Delete User")
+
+    def search_users_portfolio_groups(self, payload: Dict[str, Any], label: str = "Listing Cards Search") -> BDResponse:
+        return self.request_post_form("/api/v2/users_portfolio_groups/search", payload, label=label)
+
+    def search_data_posts(self, payload: Dict[str, Any], label: str = "Data Posts Search") -> BDResponse:
+        return self.request_post_form("/api/v2/data_posts/search", payload, label=label)
+
+    def get_data_post(self, post_id: int) -> BDResponse:
+        return self.request_get(f"/api/v2/data_posts/get/{int(post_id)}", label="Get data_post")
+
+    def update_data_post(self, payload: Dict[str, Any]) -> BDResponse:
+        if "post_id" not in payload:
+            raise BDClientError("update_data_post requires post_id")
+        return self.request_put_form("/api/v2/data_posts/update", payload, label="Update data_post")
