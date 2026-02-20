@@ -1,0 +1,1 @@
+"""VacayRank shared modules."""

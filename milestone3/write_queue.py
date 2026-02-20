@@ -57,6 +57,81 @@ def build_queue_tables(artifacts: Dict[str, List[Dict[str, Any]]]) -> List[Dict[
     return rows
 
 
+def build_write_queue_from_m2(
+    inventory_df,
+    serp_gap_df,
+    possible_matches_df,
+    duplicates_obj,
+    config: Dict[str, Any],
+) -> Dict[str, List[Dict[str, Any]]]:
+    del inventory_df, config
+
+    def _stable_row_id(match_type: str, row: Dict[str, Any]) -> str:
+        seed = [
+            match_type,
+            str(row.get("category_key") or row.get("category") or ""),
+            str(row.get("city_key") or row.get("city") or ""),
+            str(row.get("candidate_name") or row.get("title") or ""),
+            str(row.get("candidate_website") or row.get("website") or ""),
+            str(row.get("best_match_user_id") or ""),
+        ]
+        return hashlib.sha256("|".join(seed).encode("utf-8")).hexdigest()[:16]
+
+    def _normalize_row(match_type: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        proposed_patch = row.get("proposed_patch") if isinstance(row.get("proposed_patch"), dict) else {}
+        if not proposed_patch:
+            proposed_patch = {
+                "company": row.get("candidate_name") or row.get("title") or "",
+                "address1": row.get("candidate_address") or row.get("address") or "",
+                "website": row.get("candidate_website") or row.get("website") or "",
+                "phone_number": row.get("candidate_phone") or row.get("phone") or "",
+            }
+            proposed_patch = {k: v for k, v in proposed_patch.items() if str(v).strip()}
+
+        raw_ids = row.get("bd_user_ids") or row.get("cluster_user_ids") or []
+        if isinstance(raw_ids, str):
+            try:
+                raw_ids = json.loads(raw_ids)
+            except Exception:
+                raw_ids = [x.strip() for x in raw_ids.split(",") if x.strip()]
+        bd_user_ids = [int(x) for x in raw_ids if str(x).strip().isdigit()]
+
+        return {
+            "row_id": _stable_row_id(match_type, row),
+            "match_type": match_type,
+            "category_key": row.get("category_key") or row.get("category") or "",
+            "city_key": row.get("city_key") or row.get("city") or "",
+            "candidate_name": row.get("candidate_name") or row.get("title") or "",
+            "candidate_address": row.get("candidate_address") or row.get("address") or "",
+            "candidate_website": row.get("candidate_website") or row.get("website") or "",
+            "candidate_phone": row.get("candidate_phone") or row.get("phone") or "",
+            "source_url": row.get("source_url") or row.get("source") or "",
+            "match_score": float(row.get("match_score") or row.get("best_match_score") or 0),
+            "best_match_user_id": row.get("best_match_user_id"),
+            "bd_user_ids": bd_user_ids,
+            "proposed_patch": proposed_patch,
+            "status": "pending",
+            "notes": "",
+        }
+
+    missing_rows = [_normalize_row("missing", row) for row in serp_gap_df.to_dict(orient="records")]
+    possible_rows = [_normalize_row("possible_match", row) for row in possible_matches_df.to_dict(orient="records")]
+
+    duplicate_rows: List[Dict[str, Any]] = []
+    if isinstance(duplicates_obj, dict):
+        source_rows = duplicates_obj.get("clusters") or duplicates_obj.get("rows") or []
+    else:
+        source_rows = duplicates_obj or []
+    for row in source_rows:
+        duplicate_rows.append(_normalize_row("duplicate", row))
+
+    return {
+        "missing": missing_rows,
+        "possible_matches": possible_rows,
+        "duplicates": duplicate_rows,
+    }
+
+
 def update_row_status(rows: List[Dict[str, Any]], row_id: str, status: str, notes: str = "") -> None:
     for row in rows:
         if row["row_id"] == row_id:
