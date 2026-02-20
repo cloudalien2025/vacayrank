@@ -31,6 +31,7 @@ from listings_inventory_engine import (
     listings_to_csv,
     load_audit_rows,
     load_listings_inventory,
+    load_listings_progress,
     probe_listings_endpoints,
 )
 
@@ -63,7 +64,7 @@ if "listings_endpoint_decision" not in st.session_state:
 
 with st.sidebar:
     st.header("API Settings")
-    base_url = st.text_input("BD Base URL", "https://example.com")
+    base_url = st.text_input("BD Base URL", "https://www.vailvacay.com")
     api_key = st.text_input("BD API Key", type="password")
     serp_api_key = st.text_input("SerpAPI Key", type="password")
     dry_run = st.toggle("Dry Run", value=True)
@@ -260,9 +261,10 @@ with tab_inventory:
 with tab_listings:
     st.subheader("Listings Inventory (Discovery)")
     seed_url = st.text_input("Seed URL", value=f"{client.base_url}/listings")
-    listings_limit = st.number_input("Listings page size", min_value=1, max_value=200, value=100, step=1)
-    listings_max_pages = st.number_input("Listings max pages per run", min_value=1, max_value=500, value=40, step=1)
+    listings_limit = st.number_input("Listings page size", min_value=1, max_value=200, value=10, step=1)
+    listings_max_pages = st.number_input("Listings max pages per run", min_value=1, max_value=500, value=1, step=1)
     listings_rpm = st.slider("Listings Requests/Minute", min_value=5, max_value=120, value=30, step=1)
+    listings_resume = st.toggle("Resume listings from last completed page", value=True)
 
     b1, b2, b3, b4, b5 = st.columns(5)
     if b1.button("Probe API for Listings Endpoints"):
@@ -271,24 +273,41 @@ with tab_listings:
         inventory = st.session_state.listings_inventory or {}
         inventory["selected_endpoint"] = decision.selected_endpoint
         st.session_state.listings_inventory = inventory
+        if decision.selected_endpoint:
+            st.success(f"Listings API usable. Selected endpoint: {decision.selected_endpoint}")
+        else:
+            st.error(
+                "Probe failed. Endpoint/method/http/response details are in Evidence Panel. "
+                "Next action: scrape fallback is allowed only after this probe failure."
+            )
 
     endpoint = (st.session_state.listings_endpoint_decision.selected_endpoint if st.session_state.listings_endpoint_decision else None)
 
     if b2.button("Fetch Listings (API)", disabled=endpoint is None):
         try:
+            progress = load_listings_progress()
+            start_page = int(progress.get("last_completed_page", 0)) + 1 if listings_resume else 1
+            existing = (st.session_state.listings_inventory or {}).get("records", []) if listings_resume else []
             result = fetch_listings_via_api(
                 client,
                 endpoint=endpoint,
                 page_limit=int(listings_limit),
                 max_pages=int(listings_max_pages),
                 rpm=int(listings_rpm),
+                start_page=start_page,
+                existing_records=existing,
                 dry_run=dry_run,
             )
             st.session_state.listings_inventory = {"records": result.records, "selected_endpoint": endpoint}
+            st.success(
+                f"Listings fetch complete. last_page={result.last_completed_page}, total_pages={result.total_pages}, total_posts={result.total_posts}"
+            )
         except Exception as exc:
             st.error(str(exc))
 
-    if b3.button("Build Listings (Scrape Fallback)"):
+    probe_decision = st.session_state.listings_endpoint_decision
+    scrape_allowed = probe_decision is not None and probe_decision.selected_endpoint is None
+    if b3.button("Build Listings (Scrape Fallback)", disabled=not scrape_allowed):
         result = build_listings_via_scrape(client, seed_url=seed_url, max_pages=int(listings_max_pages), rpm=int(listings_rpm))
         st.session_state.listings_inventory = {"records": result.records, "selected_endpoint": None}
 
@@ -301,7 +320,11 @@ with tab_listings:
     if b5.download_button("Export Listings CSV", data=listings_to_csv(listings_records), file_name="listings_inventory.csv", mime="text/csv"):
         pass
 
+    progress = load_listings_progress()
     st.metric("Total Listings (unique)", len(listings_records))
+    st.caption(
+        f"Last page fetched: {progress.get('last_completed_page', 0)} | Total pages: {progress.get('total_pages', 0)} | Total posts: {progress.get('total_posts', 0)}"
+    )
     if listings_records:
         listings_df = pd.DataFrame(listings_records)
         st.dataframe(listings_df.head(25))
@@ -317,6 +340,8 @@ with tab_listings:
             "selected_endpoint": decision.selected_endpoint,
             "why_accepted": decision.accepted_reason,
             "why_rejected": decision.rejected_reasons[-10:],
+            "probe_details": decision.probe_details,
+            "status": "Listings API usable" if decision.selected_endpoint else "Listings API not usable (scrape fallback allowed)",
         })
     else:
         st.info("No endpoint decision yet.")
