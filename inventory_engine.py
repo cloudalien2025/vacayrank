@@ -74,13 +74,37 @@ def normalize_user(user: Dict[str, Any], base_url: str = "") -> Dict[str, Any]:
     }
 
 
-def _parse_user_rows(data: Any) -> List[Dict[str, Any]]:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        rows = data.get("data") or data.get("users") or data.get("results") or []
-        if isinstance(rows, list):
-            return rows
+def normalize_records(payload: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+    parse_errors: List[str] = []
+
+    if isinstance(payload, list):
+        return payload, parse_errors
+
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        if status is not None and str(status).lower() != "success":
+            parse_errors.append(f"BD status not success: {status}")
+
+        candidate_rows = None
+        for key in ("message", "data", "results", "users"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidate_rows = value
+                break
+
+        if candidate_rows is not None:
+            if len(candidate_rows) == 0 and str(status).lower() == "success":
+                parse_errors.append("BD returned success but no records in expected keys (message/data).")
+            return candidate_rows, parse_errors
+
+        if str(status).lower() == "success":
+            parse_errors.append("BD returned success but no records in expected keys (message/data).")
+
+        message = payload.get("error") or payload.get("message")
+        if isinstance(message, str) and message.strip():
+            parse_errors.append(f"BD payload message: {message.strip()}")
+        return [], parse_errors
+
     raise BDClientError("Unexpected payload shape from /api/v2/user/search")
 
 
@@ -104,7 +128,7 @@ def fetch_inventory_index(
             raise BDClientError(f"Inventory fetch failed with HTTP {response.status_code}")
 
         try:
-            rows = _parse_user_rows(response.json_data)
+            rows, parse_errors = normalize_records(response.json_data)
         except Exception as exc:
             client.annotate_last_evidence(parse_error=f"JSON parse error: {exc}")
             raise
@@ -112,6 +136,8 @@ def fetch_inventory_index(
         normalized = [normalize_user(row, client.base_url) for row in rows]
         records.extend(normalized)
         client.annotate_last_evidence(records_parsed=len(rows))
+        for parse_error in parse_errors:
+            client.annotate_last_evidence(records_parsed=len(rows), parse_error=parse_error)
 
         if len(rows) == 0:
             break
