@@ -55,6 +55,14 @@ normalized_base_url = base_url.strip().rstrip("/")
 client = BDClient(base_url=normalized_base_url, api_key=api_key)
 write_engine = SafeWriteEngine(client)
 
+def inventory_fingerprint(base_url: str, limit: int) -> dict:
+    return {
+        "base_url": base_url.strip().rstrip("/"),
+        "endpoint": "/api/v2/user/search",
+        "limit": int(limit),
+        "output_type": "array",
+    }
+
 
 def sync_evidence() -> None:
     st.session_state.api_evidence = list(client.evidence_log)
@@ -99,10 +107,28 @@ with tab_inventory:
         else:
             st.session_state.inventory_fetch_in_progress = True
             try:
-                progress = load_inventory_progress(PROGRESS_PATH) if resume_mode else {}
-                start_page = int(progress.get("last_page", 0)) + 1 if progress else 1
+                progress = load_inventory_progress(PROGRESS_PATH)
+                active_fingerprint = inventory_fingerprint(client.base_url, int(page_size))
+                progress_fingerprint = progress.get("fingerprint", {}) if progress else {}
+
+                start_page = 1
+                if not resume_mode and progress:
+                    st.info("Resume is disabled; starting from page 1.")
+                elif progress and progress_fingerprint == active_fingerprint:
+                    start_page = int(progress.get("last_page", 0)) + 1
+                elif progress:
+                    st.info("Progress fingerprint changed; resetting inventory fetch to page 1.")
+
+                if start_page > 1 and Path(CACHE_PATH).exists():
+                    cached_bundle = load_inventory_from_cache(CACHE_PATH)
+                    known_total_pages = int((cached_bundle.meta or {}).get("total_pages", 0) or 0)
+                    if known_total_pages and start_page > known_total_pages:
+                        st.info("Saved resume page exceeds known total_pages; restarting from page 1.")
+                        start_page = 1
+
                 if start_page > 1:
                     st.info(f"Resuming inventory fetch from page {start_page}.")
+
                 bundle = fetch_inventory_index(
                     client,
                     page_size=int(page_size),
@@ -153,15 +179,28 @@ with tab_inventory:
 
     if col4.button("Clear inventory"):
         st.session_state.inventory_bundle = None
-        if Path(PROGRESS_PATH).exists():
-            Path(PROGRESS_PATH).unlink()
+        for target_path in (Path(CACHE_PATH), Path(PROGRESS_PATH)):
+            if target_path.exists():
+                target_path.unlink()
 
     bundle: InventoryBundle | None = st.session_state.inventory_bundle
     if bundle:
         if bundle.status == "partial":
             resume_page = (bundle.meta or {}).get("resume_from_page")
             st.warning(f"Rate limited; resume from page {resume_page} after cooldown" if resume_page else "Rate limited; resume supported")
-        st.metric("Total members (API inventory)", bundle.summary.get("total_members", 0))
+        unique_user_ids = {str(row.get("user_id", "")).strip() for row in bundle.records if str(row.get("user_id", "")).strip()}
+        st.metric("Total members (API inventory)", len(unique_user_ids))
+        run_meta = bundle.meta or {}
+        st.caption(
+            "New members added this run: "
+            f"{run_meta.get('new_members_added', 0)} | "
+            f"Duplicates skipped: {run_meta.get('duplicates_skipped', 0)} | "
+            f"Pages fetched: {run_meta.get('pages_fetched', 0)} | "
+            f"Stopped because: {run_meta.get('stopped_reason', 'n/a')}"
+        )
+        progress = load_inventory_progress(PROGRESS_PATH) if resume_mode else {}
+        if resume_mode and int(progress.get("last_page", 0) or 0) > 1:
+            st.caption(f"Resume fingerprint: {json.dumps(progress.get('fingerprint', {}), sort_keys=True)}")
         c1, c2 = st.columns(2)
         c1.dataframe(pd.DataFrame(bundle.summary.get("by_category", {}).items(), columns=["member_category", "count"]))
         c2.dataframe(pd.DataFrame(bundle.summary.get("by_geo", {}).items(), columns=["member_geo", "count"]))

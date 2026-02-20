@@ -42,6 +42,33 @@ class FakeClient:
 
 
 class InventoryEngineAndCopilotTests(unittest.TestCase):
+    def test_dedupes_repeated_members_and_stops_on_no_progress(self):
+        client = FakeClient(
+            [
+                FakeResponse(json_data={"status": "success", "current_page": 1, "total_pages": 10, "message": [{"user_id": 1, "name": "A"}]}),
+                FakeResponse(json_data={"status": "success", "current_page": 2, "total_pages": 10, "message": [{"user_id": 1, "name": "A"}]}),
+                FakeResponse(json_data={"status": "success", "current_page": 3, "total_pages": 10, "message": [{"user_id": 1, "name": "A"}]}),
+            ]
+        )
+        bundle = fetch_inventory_index(client, max_pages=10)
+        self.assertEqual(len(bundle.records), 1)
+        self.assertEqual((bundle.meta or {}).get("duplicates_skipped"), 1)
+        self.assertEqual((bundle.meta or {}).get("pages_fetched"), 2)
+        self.assertEqual((bundle.meta or {}).get("stopped_reason"), "no new unique members")
+
+    def test_resume_progress_includes_fingerprint_and_stats(self):
+        progress_path = "cache/test_inventory_progress_fingerprint.json"
+        client = FakeClient(
+            [
+                FakeResponse(json_data={"status": "success", "current_page": 1, "total_pages": 1, "message": [{"user_id": 1, "name": "A"}]}),
+            ]
+        )
+        fetch_inventory_index(client, max_pages=1, progress_path=progress_path, page_size=25)
+        progress = load_inventory_progress(progress_path)
+        self.assertEqual(progress.get("fingerprint", {}).get("endpoint"), "/api/v2/user/search")
+        self.assertEqual(progress.get("fingerprint", {}).get("limit"), 25)
+        self.assertEqual(progress.get("stats", {}).get("new_members_added"), 1)
+
     def test_wrapper_message_records_parse(self):
         client = FakeClient(
             [
@@ -61,9 +88,11 @@ class InventoryEngineAndCopilotTests(unittest.TestCase):
         self.assertEqual(client.evidence_log[0].get("error_type"), "CLOUDFLARE_BLOCK")
 
     def test_cache_roundtrip_and_csv_count(self):
+        cache_path = "cache/test_inventory.json"
+        Path(cache_path).unlink(missing_ok=True)
         bundle = InventoryBundle(records=[{"user_id": 1, "name": "A"}, {"user_id": 2, "name": "B"}], inventory_index={}, summary={"total_members": 2})
-        cache_inventory_to_disk(bundle, "cache/test_inventory.json")
-        loaded = load_inventory_from_cache("cache/test_inventory.json")
+        cache_inventory_to_disk(bundle, cache_path)
+        loaded = load_inventory_from_cache(cache_path)
         self.assertEqual(len(loaded.records), 2)
         csv_data = inventory_to_csv(loaded.records)
         self.assertEqual(len([line for line in csv_data.splitlines() if line.strip()]), 3)
@@ -71,6 +100,8 @@ class InventoryEngineAndCopilotTests(unittest.TestCase):
     def test_rate_limit_returns_partial_and_progress(self):
         cache_path = "cache/test_inventory_partial.json"
         progress_path = "cache/test_inventory_progress.json"
+        Path(cache_path).unlink(missing_ok=True)
+        Path(progress_path).unlink(missing_ok=True)
         client = FakeClient(
             [
                 FakeResponse(json_data={"status": "success", "message": [{"id": 1, "name": "A"}]}),
