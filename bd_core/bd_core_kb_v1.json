@@ -1,0 +1,139 @@
+{
+  "kb_version": "1.0.0",
+  "facts": [
+    {
+      "id": "FACT_API_SEARCH_POST",
+      "title": "BD user search endpoint",
+      "statement": "/api/v2/user/search uses POST.",
+      "endpoint": "/api/v2/user/search",
+      "method": "POST",
+      "status": "active",
+      "confidence": 0.99,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Observed in VacayRank Evidence Panel", "confidence": 0.99, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_API_FORM_URLENCODED",
+      "title": "BD API v2 request encoding",
+      "statement": "BD API v2 writes and search requests are form-urlencoded in this integration.",
+      "request_encoding": "application/x-www-form-urlencoded",
+      "status": "active",
+      "confidence": 0.98,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Milestone3 client implementation and tests", "confidence": 0.98, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_OUTPUT_TYPE_ARRAY",
+      "title": "output_type=array recommendation",
+      "statement": "output_type=array is recommended for structured API search output.",
+      "status": "active",
+      "confidence": 0.94,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "BD docs + observed behavior", "confidence": 0.94, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_RESPONSE_LIST_OR_WRAPPER",
+      "title": "Search response shape",
+      "statement": "Search response may be a list or wrapper dict with status/message[].",
+      "response_shape": ["list", "dict.status+message[]", "dict.data[]"],
+      "status": "active",
+      "confidence": 0.97,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Observed in VacayRank Evidence Panel", "confidence": 0.97, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_CLOUDFLARE_SIGNATURE",
+      "title": "Cloudflare block signature",
+      "statement": "Attention Required! | Cloudflare in response HTML indicates upstream WAF block.",
+      "status": "active",
+      "confidence": 0.99,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Observed with 403 payloads", "confidence": 0.99, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_NON_HUMAN_BROWSER_RULE",
+      "title": "Non-Human Browsers rule pattern",
+      "statement": "Cloudflare rules may block python/curl/wget/headless user agents.",
+      "status": "active",
+      "confidence": 0.95,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Cloudflare rule diagnostics", "confidence": 0.95, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_API_EXEMPTION",
+      "title": "Exclude /api/ from strict browser checks",
+      "statement": "Exempting /api/ path from Non-Human Browser checks restores API access.",
+      "status": "active",
+      "confidence": 0.95,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Verified remediation in deployment", "confidence": 0.95, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_HTML_200_IS_ANOMALY",
+      "title": "HTML content at HTTP 200 is API anomaly",
+      "statement": "200 OK with text/html for API search suggests endpoint/method mismatch or upstream HTML page.",
+      "status": "active",
+      "confidence": 0.93,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Observed parsing failures", "confidence": 0.93, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_EVIDENCE_FIRST",
+      "title": "Evidence-first doctrine",
+      "statement": "Every operation must emit reproducible evidence with parse outcome; no silent empty success.",
+      "status": "active",
+      "confidence": 1.0,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "BD_Core doctrine", "confidence": 1.0, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_DRY_RUN_DEFAULT",
+      "title": "Dry Run default ON",
+      "statement": "Dry Run must default to ON for safe operations.",
+      "status": "active",
+      "confidence": 1.0,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Product doctrine", "confidence": 1.0, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_REDIRECT_RISK",
+      "title": "Base URL redirect risk",
+      "statement": "Redirected base URLs can drop headers or alter request handling; canonicalize early.",
+      "status": "active",
+      "confidence": 0.9,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Operational troubleshooting", "confidence": 0.9, "last_verified": "2026-02-20"}
+    },
+    {
+      "id": "FACT_URLENCODED_DISPLAY",
+      "title": "URL encoded fields may need decode",
+      "statement": "Values containing %3A or %2F should be decoded for readability in export/UI.",
+      "status": "active",
+      "confidence": 0.88,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Observed exported fields", "confidence": 0.88, "last_verified": "2026-02-20"}
+    }
+  ],
+  "doctrine": [
+    {
+      "id": "DOCTRINE_BD_CORE_AUTHORITY",
+      "title": "BD_Core Authority",
+      "principle": "BD_Core is the authoritative doctrine for this product line.",
+      "status": "active",
+      "confidence": 1.0,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Product doctrine", "confidence": 1.0, "last_verified": "2026-02-20"}
+    }
+  ],
+  "signals": [
+    {
+      "id": "SIGNAL_CF_ATTENTION_REQUIRED",
+      "title": "Cloudflare attention-required page",
+      "pattern": "status_code=403 and response contains 'Attention Required'",
+      "status": "active",
+      "confidence": 0.99,
+      "last_verified": "2026-02-20",
+      "provenance": {"source": "Evidence snapshots", "confidence": 0.99, "last_verified": "2026-02-20"}
+    }
+  ]
+}
