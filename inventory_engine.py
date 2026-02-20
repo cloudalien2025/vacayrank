@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ import pandas as pd
 from milestone3.bd_client import BDClient, BDClientError, BDResponse
 
 __all__ = [
+    "InventoryFetchRateLimited",
+    "RateLimiter",
     "InventoryBundle",
     "fetch_inventory_index",
     "load_inventory_from_cache",
@@ -21,11 +24,162 @@ __all__ = [
 ]
 
 
+class InventoryFetchRateLimited(RuntimeError):
+    def __init__(self, message: str, *, last_page: int, attempts: int, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.error_type = "RATE_LIMIT"
+        self.last_page = last_page
+        self.attempts = attempts
+        self.retry_after = retry_after
+
+
 @dataclass
 class InventoryBundle:
     records: List[Dict[str, Any]]
     inventory_index: Dict[Tuple[str, str], List[Dict[str, Any]]]
     summary: Dict[str, Any]
+    status: str = "complete"
+    meta: Dict[str, Any] | None = None
+
+
+class RateLimiter:
+    def __init__(self, rpm: int = 30) -> None:
+        self.rpm = max(1, int(rpm))
+        self.min_interval_sec = 60.0 / float(self.rpm)
+        self._last_request_ts: float | None = None
+
+    def wait(self) -> float:
+        now = time.monotonic()
+        jitter = self.min_interval_sec * random.uniform(-0.1, 0.1)
+        target_interval = max(0.0, self.min_interval_sec + jitter)
+        wait_s = 0.0
+        if self._last_request_ts is not None:
+            elapsed = now - self._last_request_ts
+            wait_s = max(0.0, target_interval - elapsed)
+        if wait_s > 0:
+            time.sleep(wait_s)
+        self._last_request_ts = time.monotonic()
+        return wait_s
+
+
+def _build_inventory_bundle(records: List[Dict[str, Any]], *, status: str = "complete", meta: Dict[str, Any] | None = None) -> InventoryBundle:
+    inventory_index: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    cat_counter: Counter[str] = Counter()
+    geo_counter: Counter[str] = Counter()
+    status_counter: Counter[str] = Counter()
+    plan_counter: Counter[str] = Counter()
+
+    for row in records:
+        category = (row["primary_category"] or "Uncategorized").strip().lower()
+        geo = (row["location"] or "Unknown").strip().lower()
+        inventory_index[(category, geo)].append(row)
+        cat_counter[row["primary_category"] or "Uncategorized"] += 1
+        geo_counter[row["location"] or "Unknown"] += 1
+        status_counter[row["status"]] += 1
+        plan_counter[row["plan"] or "Unknown"] += 1
+
+    summary = {
+        "total_members": len(records),
+        "by_category": dict(cat_counter),
+        "by_geo": dict(geo_counter),
+        "status_distribution": dict(status_counter),
+        "membership_plan_distribution": dict(plan_counter),
+    }
+    return InventoryBundle(records=records, inventory_index=dict(inventory_index), summary=summary, status=status, meta=meta or {})
+
+
+def _parse_retry_after(response: BDResponse) -> float | None:
+    retry_after = (response.headers or {}).get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        return max(0.0, float(retry_after))
+    except (TypeError, ValueError):
+        return None
+
+
+def _request_with_backoff(
+    client: BDClient,
+    payload: Dict[str, Any],
+    limiter: RateLimiter,
+    *,
+    max_attempts: int = 6,
+    max_5xx_attempts: int = 3,
+) -> BDResponse:
+    retry_after_hint: float | None = None
+    for attempt in range(1, max_attempts + 1):
+        pre_wait = limiter.wait()
+        response = client.search_users(payload)
+        evidence = client.evidence_log[-1] if client.evidence_log else None
+        if evidence is not None:
+            evidence["attempt_no"] = attempt
+            evidence["limiter_rpm"] = limiter.rpm
+            evidence["wait_s"] = round(pre_wait, 3)
+
+        if 200 <= response.status_code < 300:
+            if evidence is not None and "error_type" not in evidence:
+                evidence["error_type"] = "NONE"
+            return response
+
+        is_429 = response.status_code == 429
+        is_5xx = 500 <= response.status_code <= 599
+        if not (is_429 or is_5xx):
+            return response
+
+        if is_429:
+            retry_after = _parse_retry_after(response)
+            retry_after_hint = retry_after if retry_after is not None else retry_after_hint
+            backoff = retry_after if retry_after is not None else min(60.0, 2.0 * (2 ** (attempt - 1)))
+            backoff += random.uniform(0, 0.5)
+            if evidence is not None:
+                evidence["error_type"] = "RATE_LIMIT"
+                evidence["retry_after_s"] = retry_after
+                evidence["backoff_s"] = round(backoff, 3)
+            if attempt == max_attempts:
+                break
+            time.sleep(backoff)
+            continue
+
+        if is_5xx:
+            backoff = min(30.0, 1.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+            if evidence is not None:
+                evidence["error_type"] = "UPSTREAM_5XX"
+                evidence["backoff_s"] = round(backoff, 3)
+            if attempt >= max_5xx_attempts:
+                return response
+            time.sleep(backoff)
+
+    raise InventoryFetchRateLimited(
+        "Too many API requests per minute",
+        last_page=int(payload.get("page", 1)) - 1,
+        attempts=max_attempts,
+        retry_after=retry_after_hint,
+    )
+
+
+def _write_inventory_progress(progress_path: Path, *, last_page: int, records: int) -> None:
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_path.write_text(
+        json.dumps(
+            {
+                "last_page": int(last_page),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "records": int(records),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def load_inventory_progress(path: str) -> Dict[str, Any]:
+    progress_path = Path(path)
+    if not progress_path.exists():
+        return {}
+    try:
+        return json.loads(progress_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def _first_non_empty(payload: Dict[str, Any], keys: Iterable[str], default: str = "") -> str:
@@ -155,12 +309,41 @@ def fetch_inventory_index(
     client: BDClient,
     page_size: int = 100,
     max_pages: int = 200,
-    delay_seconds: float = 0.15,
+    delay_seconds: float = 0.0,
+    requests_per_minute: int = 30,
+    start_page: int = 1,
+    cache_path: str | None = None,
+    progress_path: str = "cache/inventory_progress.json",
 ) -> InventoryBundle:
     records: List[Dict[str, Any]] = []
-    for page in range(1, max_pages + 1):
+    progress_file = Path(progress_path)
+    if cache_path and Path(cache_path).exists():
+        existing = load_inventory_from_cache(cache_path)
+        records = list(existing.records)
+
+    limiter = RateLimiter(rpm=requests_per_minute)
+    end_page = start_page + max_pages - 1
+    for page in range(start_page, end_page + 1):
         payload = {"output_type": "array", "page": page, "limit": page_size}
-        response = client.search_users(payload)
+        try:
+            response = _request_with_backoff(client, payload, limiter)
+        except InventoryFetchRateLimited as exc:
+            _write_inventory_progress(progress_file, last_page=max(start_page - 1, page - 1), records=len(records))
+            partial_bundle = _build_inventory_bundle(
+                records,
+                status="partial",
+                meta={
+                    "error_type": exc.error_type,
+                    "last_page": max(start_page - 1, page - 1),
+                    "resume_from_page": page,
+                    "attempts": exc.attempts,
+                    "retry_after_s": exc.retry_after,
+                    "message": f"Rate limited; resume from page {page} after cooldown",
+                },
+            )
+            if cache_path:
+                cache_inventory_to_disk(partial_bundle, cache_path)
+            return partial_bundle
         _apply_response_classification(response, client)
 
         if not response.ok:
@@ -178,32 +361,12 @@ def fetch_inventory_index(
 
         if len(rows) == 0:
             break
+        _write_inventory_progress(progress_file, last_page=page, records=len(records))
+        if cache_path:
+            cache_inventory_to_disk(_build_inventory_bundle(records), cache_path)
         if delay_seconds > 0:
             time.sleep(delay_seconds)
-
-    inventory_index: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
-    cat_counter: Counter[str] = Counter()
-    geo_counter: Counter[str] = Counter()
-    status_counter: Counter[str] = Counter()
-    plan_counter: Counter[str] = Counter()
-
-    for row in records:
-        category = (row["primary_category"] or "Uncategorized").strip().lower()
-        geo = (row["location"] or "Unknown").strip().lower()
-        inventory_index[(category, geo)].append(row)
-        cat_counter[row["primary_category"] or "Uncategorized"] += 1
-        geo_counter[row["location"] or "Unknown"] += 1
-        status_counter[row["status"]] += 1
-        plan_counter[row["plan"] or "Unknown"] += 1
-
-    summary = {
-        "total_members": len(records),
-        "by_category": dict(cat_counter),
-        "by_geo": dict(geo_counter),
-        "status_distribution": dict(status_counter),
-        "membership_plan_distribution": dict(plan_counter),
-    }
-    return InventoryBundle(records=records, inventory_index=dict(inventory_index), summary=summary)
+    return _build_inventory_bundle(records)
 
 
 def cache_inventory_to_disk(bundle: InventoryBundle, path: str, *, base_url_used: str = "", payload_defaults: Dict[str, Any] | None = None) -> None:
@@ -214,6 +377,8 @@ def cache_inventory_to_disk(bundle: InventoryBundle, path: str, *, base_url_used
             "endpoint": "/api/v2/user/search",
             "payload_defaults": payload_defaults or {"output_type": "array", "limit": 100},
             "total_records": len(bundle.records),
+            "status": bundle.status,
+            "meta": bundle.meta or {},
         },
         "records": bundle.records,
         "summary": bundle.summary,
@@ -233,6 +398,8 @@ def load_inventory_from_cache(path: str) -> InventoryBundle:
         records=payload.get("records", []),
         inventory_index=inventory_index,
         summary=payload.get("summary", {}),
+        status=(payload.get("metadata", {}) or {}).get("status", "complete"),
+        meta=(payload.get("metadata", {}) or {}).get("meta", {}),
     )
 
 

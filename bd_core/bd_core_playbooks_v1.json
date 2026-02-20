@@ -15,7 +15,11 @@
       "status": "active",
       "confidence": 0.98,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "VacayRank production remediation", "confidence": 0.98, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "VacayRank production remediation",
+        "confidence": 0.98,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "PLAYBOOK_FIX_BD_WRAPPER_PARSING",
@@ -31,7 +35,11 @@
       "status": "active",
       "confidence": 0.96,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Observed endpoint behavior", "confidence": 0.96, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Observed endpoint behavior",
+        "confidence": 0.96,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "PLAYBOOK_FIX_AUTH_FORBIDDEN",
@@ -46,7 +54,11 @@
       "status": "active",
       "confidence": 0.95,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Operational checklist", "confidence": 0.95, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Operational checklist",
+        "confidence": 0.95,
+        "last_verified": "2026-02-20"
+      }
     },
     {
       "id": "PLAYBOOK_FIX_BASE_URL_REDIRECT",
@@ -61,7 +73,31 @@
       "status": "active",
       "confidence": 0.9,
       "last_verified": "2026-02-20",
-      "provenance": {"source": "Observed redirect behavior", "confidence": 0.9, "last_verified": "2026-02-20"}
+      "provenance": {
+        "source": "Observed redirect behavior",
+        "confidence": 0.9,
+        "last_verified": "2026-02-20"
+      }
+    },
+    {
+      "id": "PLAYBOOK_RATE_LIMIT",
+      "title": "Recover from BD API rate limiting",
+      "when_to_use": "HTTP 429 and/or message indicates too many API requests per minute",
+      "steps": [
+        "Confirm evidence shows status_code=429 and message includes 'Too many API requests per minute'.",
+        "Set Inventory Requests/Minute to 20\u201330.",
+        "Set Max pages per run to 10\u201325.",
+        "Re-run in batches until inventory completes.",
+        "If still rate limited, wait 60\u2013120s and retry; honor Retry-After when present."
+      ],
+      "status": "active",
+      "confidence": 0.98,
+      "last_verified": "2026-02-20",
+      "provenance": {
+        "source": "Operational mitigation playbook",
+        "confidence": 0.98,
+        "last_verified": "2026-02-20"
+      }
     }
   ]
 }
