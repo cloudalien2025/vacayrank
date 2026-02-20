@@ -23,6 +23,7 @@ __all__ = [
     "cache_inventory_to_disk",
     "inventory_to_csv",
     "normalize_records",
+    "build_canonical_member_set",
 ]
 
 
@@ -70,6 +71,25 @@ def _normalize_user_id(value: Any) -> str:
     return str(value).strip()
 
 
+def build_canonical_member_set(raw_members: List[dict]) -> Dict[str, dict]:
+    """Return canonical members keyed by normalized ``user_id``.
+
+    Rows without ``user_id`` are ignored. Duplicate ``user_id`` rows are
+    resolved via deterministic last-write-wins semantics based on incoming order.
+    """
+
+    canonical_members: Dict[str, dict] = {}
+    for row in raw_members:
+        if not isinstance(row, dict):
+            continue
+        user_id = _normalize_user_id(row.get("user_id"))
+        if not user_id:
+            continue
+        member = {**row, "user_id": user_id}
+        canonical_members[user_id] = member
+    return canonical_members
+
+
 def _inventory_fingerprint(*, base_url: str, page_size: int, output_type: str = "array") -> Dict[str, Any]:
     return {
         "base_url": str(base_url or "").rstrip("/"),
@@ -96,13 +116,15 @@ def _extract_pagination_meta(payload: Any) -> Dict[str, int]:
 
 
 def _build_inventory_bundle(records: List[Dict[str, Any]], *, status: str = "complete", meta: Dict[str, Any] | None = None) -> InventoryBundle:
+    canonical_members = build_canonical_member_set(records)
+    canonical_records = list(canonical_members.values())
     inventory_index: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     cat_counter: Counter[str] = Counter()
     geo_counter: Counter[str] = Counter()
     status_counter: Counter[str] = Counter()
     plan_counter: Counter[str] = Counter()
 
-    for row in records:
+    for row in canonical_records:
         primary_category = str(row.get("primary_category") or "Uncategorized")
         location = str(row.get("location") or "Unknown")
         member_status = str(row.get("status") or "unknown")
@@ -117,13 +139,13 @@ def _build_inventory_bundle(records: List[Dict[str, Any]], *, status: str = "com
         plan_counter[plan] += 1
 
     summary = {
-        "total_members": len(records),
+        "total_members": len(canonical_records),
         "by_category": dict(cat_counter),
         "by_geo": dict(geo_counter),
         "status_distribution": dict(status_counter),
         "membership_plan_distribution": dict(plan_counter),
     }
-    return InventoryBundle(records=records, inventory_index=dict(inventory_index), summary=summary, status=status, meta=meta or {})
+    return InventoryBundle(records=canonical_records, inventory_index=dict(inventory_index), summary=summary, status=status, meta=meta or {})
 
 
 def _parse_retry_after(response: BDResponse) -> float | None:
@@ -375,7 +397,7 @@ def fetch_inventory_index(
     progress_path: str = "cache/inventory_progress.json",
 ) -> InventoryBundle:
     records: List[Dict[str, Any]] = []
-    records_by_user_id: Dict[str, Dict[str, Any]] = {}
+    seeded_records: List[Dict[str, Any]] = []
     pages_fetched = 0
     duplicates_skipped = 0
     new_members_added = 0
@@ -386,14 +408,9 @@ def fetch_inventory_index(
     progress_file = Path(progress_path)
     if cache_path and Path(cache_path).exists():
         existing = load_inventory_from_cache(cache_path)
-        for row in existing.records:
-            user_id = _normalize_user_id(row.get("user_id"))
-            if not user_id:
-                continue
-            records_by_user_id[user_id] = row
+        seeded_records = list(existing.records)
 
-    records = list(records_by_user_id.values())
-    seen_user_ids = set(records_by_user_id.keys())
+    records.extend(seeded_records)
 
     limiter = RateLimiter(rpm=requests_per_minute)
     end_page = start_page + max_pages - 1
@@ -447,23 +464,16 @@ def fetch_inventory_index(
         rows, parse_errors, bd_status = _normalize_records(response.json_data)
         normalized = _decode_presentation_fields([normalize_user(row, client.base_url) for row in rows])
         pages_fetched += 1
-        page_new = 0
-        page_duplicates = 0
-        for row in normalized:
-            user_id = _normalize_user_id(row.get("user_id"))
-            if not user_id:
-                continue
-            row["user_id"] = user_id
-            if user_id in seen_user_ids:
-                page_duplicates += 1
-                continue
-            seen_user_ids.add(user_id)
-            records_by_user_id[user_id] = row
-            page_new += 1
+        before_total_unique = len(build_canonical_member_set(records))
+        page_canonical = build_canonical_member_set(normalized)
+
+        records.extend(list(page_canonical.values()))
+        after_total_unique = len(build_canonical_member_set(records))
+        page_new = max(0, after_total_unique - before_total_unique)
+        page_duplicates = max(0, len(normalized) - page_new)
 
         duplicates_skipped += page_duplicates
         new_members_added += page_new
-        records = list(records_by_user_id.values())
         _update_last_evidence_parse(client, records_parsed=len(rows), bd_status=bd_status, parse_errors=parse_errors, payload=response.json_data)
 
         if client.evidence_log:
@@ -529,15 +539,8 @@ def fetch_inventory_index(
 
 
 def cache_inventory_to_disk(bundle: InventoryBundle, path: str, *, base_url_used: str = "", payload_defaults: Dict[str, Any] | None = None) -> None:
-    unique_records: Dict[str, Dict[str, Any]] = {}
-    for row in bundle.records:
-        user_id = _normalize_user_id(row.get("user_id"))
-        if not user_id:
-            continue
-        row["user_id"] = user_id
-        unique_records[user_id] = row
-
-    ordered_records = list(unique_records.values())
+    canonical_bundle = _build_inventory_bundle(bundle.records, status=bundle.status, meta=bundle.meta)
+    ordered_records = canonical_bundle.records
     payload = {
         "metadata": {
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -549,8 +552,8 @@ def cache_inventory_to_disk(bundle: InventoryBundle, path: str, *, base_url_used
             "meta": bundle.meta or {},
         },
         "records": ordered_records,
-        "summary": {**(bundle.summary or {}), "total_members": len(ordered_records)},
-        "inventory_index": {f"{k[0]}|||{k[1]}": v for k, v in bundle.inventory_index.items()},
+        "summary": canonical_bundle.summary,
+        "inventory_index": {f"{k[0]}|||{k[1]}": v for k, v in canonical_bundle.inventory_index.items()},
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -571,16 +574,10 @@ def load_inventory_from_cache(path: str) -> InventoryBundle:
 
     records = list(records_by_user_id.values())
     recalculated_bundle = _build_inventory_bundle(records)
-    inventory_index = {}
-    for key, value in payload.get("inventory_index", {}).items():
-        category, geo = key.split("|||", 1)
-        inventory_index[(category, geo)] = value
-    if not inventory_index:
-        inventory_index = recalculated_bundle.inventory_index
     return InventoryBundle(
-        records=records,
-        inventory_index=inventory_index,
-        summary=payload.get("summary", {}) or recalculated_bundle.summary,
+        records=recalculated_bundle.records,
+        inventory_index=recalculated_bundle.inventory_index,
+        summary=recalculated_bundle.summary,
         status=(payload.get("metadata", {}) or {}).get("status", "complete"),
         meta=(payload.get("metadata", {}) or {}).get("meta", {}),
     )

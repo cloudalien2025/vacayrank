@@ -2,7 +2,15 @@ import unittest
 from pathlib import Path
 
 from bd_copilot import evaluate_rules
-from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache, load_inventory_progress
+from inventory_engine import (
+    InventoryBundle,
+    build_canonical_member_set,
+    cache_inventory_to_disk,
+    fetch_inventory_index,
+    inventory_to_csv,
+    load_inventory_from_cache,
+    load_inventory_progress,
+)
 
 
 class FakeResponse:
@@ -96,6 +104,37 @@ class InventoryEngineAndCopilotTests(unittest.TestCase):
         self.assertEqual(len(loaded.records), 2)
         csv_data = inventory_to_csv(loaded.records)
         self.assertEqual(len([line for line in csv_data.splitlines() if line.strip()]), 3)
+
+
+    def test_build_canonical_member_set_last_write_wins(self):
+        canonical = build_canonical_member_set(
+            [
+                {"user_id": "1", "plan": "Free"},
+                {"user_id": 1, "plan": "Pro"},
+                {"name": "missing user"},
+            ]
+        )
+        self.assertEqual(len(canonical), 1)
+        self.assertEqual(canonical["1"]["plan"], "Pro")
+
+    def test_summary_uses_canonical_members_only(self):
+        bundle = InventoryBundle(
+            records=[
+                {"user_id": "1", "primary_category": "Cat A", "location": "USA", "status": "active", "plan": "Free"},
+                {"user_id": "1", "primary_category": "Cat B", "location": "Canada", "status": "inactive", "plan": "Pro"},
+            ],
+            inventory_index={},
+            summary={},
+        )
+        cache_path = "cache/test_inventory_summary_canonical.json"
+        Path(cache_path).unlink(missing_ok=True)
+        cache_inventory_to_disk(bundle, cache_path)
+        loaded = load_inventory_from_cache(cache_path)
+        self.assertEqual(loaded.summary.get("total_members"), 1)
+        self.assertEqual(loaded.summary.get("by_category"), {"Cat B": 1})
+        self.assertEqual(loaded.summary.get("by_geo"), {"Canada": 1})
+        self.assertEqual(loaded.summary.get("status_distribution"), {"inactive": 1})
+        self.assertEqual(loaded.summary.get("membership_plan_distribution"), {"Pro": 1})
 
     def test_rate_limit_returns_partial_and_progress(self):
         cache_path = "cache/test_inventory_partial.json"
