@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -10,7 +12,7 @@ import streamlit as st
 from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
 from inventory_engine import InventoryBundle, cache_inventory_to_disk, fetch_inventory_index, inventory_to_csv, load_inventory_from_cache
-from milestone3.bd_client import BDClient
+from milestone3.bd_client import BDClient, BDClientError
 from serp_gap_engine import run_serp_gap_analysis
 from structural_audit_engine import run_structural_audit
 
@@ -27,6 +29,10 @@ if "serp_rows" not in st.session_state:
     st.session_state.serp_rows = []
 if "write_engine_log" not in st.session_state:
     st.session_state.write_engine_log = []
+if "api_evidence" not in st.session_state:
+    st.session_state.api_evidence = []
+if "run_audit_log" not in st.session_state:
+    st.session_state.run_audit_log = []
 
 with st.sidebar:
     st.header("API Settings")
@@ -35,38 +41,114 @@ with st.sidebar:
     serp_api_key = st.text_input("SerpAPI Key", type="password")
     dry_run = st.toggle("Dry Run", value=True)
     typed_confirm = st.text_input("Typed Confirm", value="")
+    page_size = st.number_input("Inventory page size", min_value=1, max_value=200, value=100, step=1)
+    max_pages = st.number_input("Inventory max pages", min_value=1, max_value=500, value=200, step=1)
 
-client = BDClient(base_url=base_url, api_key=api_key)
+normalized_base_url = base_url.strip().rstrip("/")
+client = BDClient(base_url=normalized_base_url, api_key=api_key)
 write_engine = SafeWriteEngine(client)
+
+def sync_evidence() -> None:
+    st.session_state.api_evidence = list(client.evidence_log)
+
+
+def append_run_audit(action: str, records_fetched: int, pages_fetched: int, outcome: str) -> None:
+    run_id = str(uuid.uuid4())
+    evidence_path = f"session://api_evidence/{run_id}"
+    st.session_state.run_audit_log.append(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_id,
+            "action": action,
+            "records_fetched": records_fetched,
+            "pages_fetched": pages_fetched,
+            "status_outcome": outcome,
+            "evidence_ref": evidence_path,
+        }
+    )
+
 
 tab_inventory, tab_audit, tab_serp, tab_write, tab_log = st.tabs(
     ["Inventory (API Index)", "Structural Audit", "SERP Gap Analysis", "Write Queue", "Audit Log"]
 )
 
 with tab_inventory:
-    st.subheader("Milestone 1 — API Inventory Index")
-    col1, col2, col3 = st.columns(3)
+    st.subheader("Milestone 1 — API Member Inventory")
+    if st.button("Resolve BD Base URL"):
+        resolved_base = client.resolve_base_url()
+        sync_evidence()
+        st.info(f"Resolved base URL: {resolved_base}")
+
+    st.caption(f"Final resolved base URL in use: {client.base_url}")
+
+    col1, col2, col3, col4 = st.columns(4)
     if col1.button("Fetch from /api/v2/user/search"):
-        st.session_state.inventory_bundle = fetch_inventory_index(client)
-        cache_inventory_to_disk(st.session_state.inventory_bundle, CACHE_PATH)
-    if col2.button("Load cached inventory"):
+        try:
+            bundle = fetch_inventory_index(client, page_size=int(page_size), max_pages=int(max_pages))
+            st.session_state.inventory_bundle = bundle
+            cache_inventory_to_disk(
+                bundle,
+                CACHE_PATH,
+                base_url_used=client.base_url,
+                payload_defaults={"output_type": "array", "limit": int(page_size)},
+            )
+            pages_fetched = sum(1 for x in client.evidence_log if x.get("label") == "M1 Inventory Fetch")
+            append_run_audit("M1 Inventory Fetch", len(bundle.records), pages_fetched, "success")
+        except Exception as exc:
+            append_run_audit("M1 Inventory Fetch", 0, 0, f"error: {exc}")
+            st.error(str(exc))
+        finally:
+            sync_evidence()
+
+    if col2.button("Single Page Test"):
+        try:
+            payload = {"output_type": "array", "page": 1, "limit": int(page_size)}
+            response = client.search_users(payload, label="M1 Single Page Test")
+            content_type = (response.content_type or "").lower()
+            if "text/html" in content_type or response.text.lstrip().startswith("<"):
+                client.annotate_last_evidence(parse_error="HTML response detected; output_type=array missing or endpoint returned HTML")
+                raise BDClientError("Single page test returned HTML. output_type=array may be missing or ignored.")
+            if not response.ok:
+                client.annotate_last_evidence(parse_error=f"HTTP {response.status_code}")
+                raise BDClientError(f"Single page test failed with HTTP {response.status_code}")
+            parsed = response.json_data if isinstance(response.json_data, list) else response.json_data.get("data", [])
+            parsed_count = len(parsed) if isinstance(parsed, list) else 0
+            client.annotate_last_evidence(records_parsed=parsed_count)
+            append_run_audit("M1 Single Page Test", parsed_count, 1, "success")
+            st.success(f"Single page parsed records: {parsed_count}")
+        except Exception as exc:
+            append_run_audit("M1 Single Page Test", 0, 1, f"error: {exc}")
+            st.error(str(exc))
+        finally:
+            sync_evidence()
+
+    if col3.button("Load cached inventory"):
         if Path(CACHE_PATH).exists():
             st.session_state.inventory_bundle = load_inventory_from_cache(CACHE_PATH)
         else:
             st.warning("No cache file found")
-    if col3.button("Clear inventory"):
+
+    if col4.button("Clear inventory"):
         st.session_state.inventory_bundle = None
 
     bundle: InventoryBundle | None = st.session_state.inventory_bundle
     if bundle:
-        st.metric("Total listings", bundle.summary.get("total_listings", 0))
+        st.metric("Total members (API inventory)", bundle.summary.get("total_members", 0))
         c1, c2 = st.columns(2)
-        c1.dataframe(pd.DataFrame(bundle.summary.get("by_category", {}).items(), columns=["category", "count"]))
-        c2.dataframe(pd.DataFrame(bundle.summary.get("by_geo", {}).items(), columns=["geo", "count"]))
+        c1.dataframe(pd.DataFrame(bundle.summary.get("by_category", {}).items(), columns=["member_category", "count"]))
+        c2.dataframe(pd.DataFrame(bundle.summary.get("by_geo", {}).items(), columns=["member_geo", "count"]))
         c3, c4 = st.columns(2)
-        c3.dataframe(pd.DataFrame(bundle.summary.get("status_distribution", {}).items(), columns=["status", "count"]))
-        c4.dataframe(pd.DataFrame(bundle.summary.get("membership_plan_distribution", {}).items(), columns=["plan", "count"]))
-        st.download_button("Export Inventory CSV", data=inventory_to_csv(bundle.records), file_name="inventory_api_index.csv", mime="text/csv")
+        c3.dataframe(pd.DataFrame(bundle.summary.get("status_distribution", {}).items(), columns=["member_status", "count"]))
+        c4.dataframe(pd.DataFrame(bundle.summary.get("membership_plan_distribution", {}).items(), columns=["member_plan", "count"]))
+        st.download_button("Export Member Inventory CSV", data=inventory_to_csv(bundle.records), file_name="member_inventory_api_index.csv", mime="text/csv")
+
+    st.markdown("### API Evidence Panel")
+    if st.session_state.api_evidence:
+        evidence_df = pd.DataFrame(st.session_state.api_evidence)
+        st.dataframe(evidence_df)
+        st.json(st.session_state.api_evidence[-1])
+    else:
+        st.info("No API evidence yet.")
 
 with tab_audit:
     st.subheader("Milestone 2.5 — BD Structural Audit")
@@ -88,7 +170,7 @@ with tab_serp:
     st.subheader("Milestone 2 — SERP + Category/Geo Gap Engine")
     bundle = st.session_state.inventory_bundle
     if not bundle:
-        st.info("Load inventory index first.")
+        st.info("Load member inventory index first.")
     else:
         default_pairs = [f"{k[0]}|||{k[1]}" for k in list(bundle.inventory_index.keys())[:30]]
         selected_pairs = st.multiselect("Category + Geo pairs", options=default_pairs, default=default_pairs[:5])
@@ -172,6 +254,12 @@ with tab_write:
 
 with tab_log:
     st.subheader("Audit Log")
+    st.markdown("#### Write Engine Audit")
     entries = st.session_state.write_engine_log
     st.dataframe(pd.DataFrame(entries))
-    st.download_button("Download audit JSON", data=json.dumps(entries, indent=2), file_name="audit_log.json", mime="application/json")
+    st.download_button("Download write audit JSON", data=json.dumps(entries, indent=2), file_name="write_audit_log.json", mime="application/json")
+
+    st.markdown("#### API Run Audit")
+    run_entries = st.session_state.run_audit_log
+    st.dataframe(pd.DataFrame(run_entries))
+    st.download_button("Download API run audit JSON", data=json.dumps(run_entries, indent=2), file_name="api_run_audit_log.json", mime="application/json")
