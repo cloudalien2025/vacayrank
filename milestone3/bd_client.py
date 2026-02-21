@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -25,7 +26,7 @@ class BDClient:
     """Brilliant Directories API v2 client with strict write encoding rules."""
 
     def __init__(self, base_url: str, api_key: str, timeout: int = 20) -> None:
-        self.base_url = base_url.rstrip("/")
+        self.base_url = normalize_base_url(base_url)
         self.api_key = api_key
         self.timeout = timeout
         self.evidence_log: List[Dict[str, Any]] = []
@@ -108,7 +109,10 @@ class BDClient:
         payload_dict: Optional[Dict[str, Any]] = None,
         include_form: bool = False,
     ) -> BDResponse:
-        url = f"{self.base_url}{path}"
+        normalized_path = str(path or "").strip()
+        if not normalized_path.startswith("/"):
+            normalized_path = f"/{normalized_path}"
+        url = f"{self.base_url}{normalized_path}"
         headers = self._headers(include_form=include_form)
         method_upper = method.upper()
         if method_upper == "GET":
@@ -148,7 +152,7 @@ class BDClient:
         probe_url = self.base_url
         try:
             response = requests.get(probe_url, timeout=self.timeout, allow_redirects=True)
-            final_url = response.url.rstrip("/")
+            final_url = normalize_base_url(response.url)
             self._append_evidence(
                 label="Base URL Resolve",
                 method="GET",
@@ -176,6 +180,7 @@ class BDClient:
                 }
             )
         return self.base_url
+
 
     def request_get(self, path: str, label: str = "GET request") -> BDResponse:
         return self._request(method="GET", path=path, label=label)
@@ -223,3 +228,20 @@ class BDClient:
         if "post_id" not in payload:
             raise BDClientError("update_data_post requires post_id")
         return self.request_put_form("/api/v2/data_posts/update", payload, label="Update data_post")
+
+
+def normalize_base_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        raise BDClientError("Base URL is required")
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    if not parsed.netloc:
+        raise BDClientError(f"Invalid base URL (missing host): {url!r}")
+    clean = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+    path = (parsed.path or "").strip()
+    if path and path != "/":
+        clean = f"{clean}{path.rstrip('/')}"
+    return clean.rstrip("/")
+

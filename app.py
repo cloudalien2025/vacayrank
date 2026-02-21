@@ -25,7 +25,7 @@ from inventory_engine import (
     load_inventory_from_cache,
     load_inventory_progress,
 )
-from milestone3.bd_client import BDClient
+from milestone3.bd_client import BDClient, normalize_base_url
 import serp_gap_engine as sge
 from structural_audit_engine import run_structural_audit
 
@@ -47,6 +47,7 @@ listings_to_csv = getattr(lie, "listings_to_csv", _missing_engine_fn("listings_i
 load_audit_rows = getattr(lie, "load_audit_rows", _missing_engine_fn("listings_inventory_engine", "load_audit_rows"))
 load_listings_inventory = getattr(lie, "load_listings_inventory", lambda: {"records": [], "selected_endpoint": None})
 load_listings_progress = getattr(lie, "load_listings_progress", lambda: {"last_completed_page": 0, "total_pages": 0, "total_posts": 0})
+normalize_endpoint = getattr(lie, "normalize_endpoint", lambda value: value)
 probe_listings_endpoints = getattr(lie, "probe_listings_endpoints", _missing_engine_fn("listings_inventory_engine", "probe_listings_endpoints"))
 run_serp_gap_analysis = getattr(sge, "run_serp_gap_analysis", _missing_engine_fn("serp_gap_engine", "run_serp_gap_analysis"))
 
@@ -73,6 +74,8 @@ if "listings_inventory" not in st.session_state:
     st.session_state.listings_inventory = load_listings_inventory()
 if "listings_endpoint_decision" not in st.session_state:
     st.session_state.listings_endpoint_decision = None
+if "listings_progress" not in st.session_state:
+    st.session_state.listings_progress = load_listings_progress()
 if "hydration_capability" not in st.session_state:
     st.session_state.hydration_capability = None
 if "hydration_last_result" not in st.session_state:
@@ -93,13 +96,13 @@ with st.sidebar:
     max_pages_per_run = st.number_input("Max pages per run", min_value=1, max_value=int(inventory_max_pages), value=min(20, int(inventory_max_pages)), step=1)
     resume_mode = st.toggle("Resume from last page if progress exists", value=True)
 
-normalized_base_url = base_url.strip().rstrip("/")
+normalized_base_url = normalize_base_url(base_url)
 client = BDClient(base_url=normalized_base_url, api_key=api_key)
 write_engine = SafeWriteEngine(client)
 
 def inventory_fingerprint(base_url: str, limit: int) -> dict:
     return {
-        "base_url": base_url.strip().rstrip("/"),
+        "base_url": normalize_base_url(base_url),
         "endpoint": "/api/v2/user/search",
         "limit": int(limit),
         "output_type": "array",
@@ -298,7 +301,7 @@ with tab_listings:
         decision = probe_listings_endpoints(client, dry_run=dry_run)
         st.session_state.listings_endpoint_decision = decision
         inventory = st.session_state.listings_inventory or {}
-        inventory["selected_endpoint"] = decision.selected_endpoint
+        inventory["selected_endpoint"] = normalize_endpoint(decision.selected_endpoint)
         st.session_state.listings_inventory = inventory
         if decision.selected_endpoint:
             st.success(f"Listings API usable. Selected endpoint: {decision.selected_endpoint}")
@@ -308,29 +311,34 @@ with tab_listings:
                 "Next action: scrape fallback is allowed only after this probe failure."
             )
 
-    endpoint = (st.session_state.listings_endpoint_decision.selected_endpoint if st.session_state.listings_endpoint_decision else None)
+    endpoint = normalize_endpoint(st.session_state.listings_endpoint_decision.selected_endpoint) if st.session_state.listings_endpoint_decision else None
 
     if b2.button("Fetch Listings (API)", disabled=endpoint is None):
-        try:
-            progress = load_listings_progress()
-            start_page = int(progress.get("last_completed_page", 0)) + 1 if listings_resume else 1
-            existing = (st.session_state.listings_inventory or {}).get("records", []) if listings_resume else []
-            result = fetch_listings_via_api(
-                client,
-                endpoint=endpoint,
-                page_limit=int(listings_limit),
-                max_pages=int(listings_max_pages),
-                rpm=int(listings_rpm),
-                start_page=start_page,
-                existing_records=existing,
-                dry_run=dry_run,
-            )
-            st.session_state.listings_inventory = {"records": result.records, "selected_endpoint": endpoint}
-            st.success(
-                f"Listings fetch complete. last_page={result.last_completed_page}, total_pages={result.total_pages}, total_posts={result.total_posts}"
-            )
-        except Exception as exc:
-            st.error(str(exc))
+        if endpoint is None:
+            st.warning("Run 'Probe API for Listings Endpoints' first.")
+        else:
+            try:
+                progress = st.session_state.listings_progress if st.session_state.listings_progress else load_listings_progress()
+                st.session_state.listings_progress = progress
+                start_page = int(progress.get("last_completed_page", 0)) + 1 if listings_resume else 1
+                existing = (st.session_state.listings_inventory or {}).get("records", []) if listings_resume else []
+                result = fetch_listings_via_api(
+                    client,
+                    endpoint=endpoint,
+                    page_limit=int(listings_limit),
+                    max_pages=int(listings_max_pages),
+                    rpm=int(listings_rpm),
+                    start_page=start_page,
+                    existing_records=existing,
+                    dry_run=dry_run,
+                )
+                st.session_state.listings_inventory = {"records": result.records, "selected_endpoint": normalize_endpoint(endpoint)}
+                st.session_state.listings_progress = {"last_completed_page": result.last_completed_page, "total_pages": result.total_pages, "total_posts": result.total_posts}
+                st.success(
+                    f"Listings fetch complete. last_page={result.last_completed_page}, total_pages={result.total_pages}, total_posts={result.total_posts}"
+                )
+            except Exception as exc:
+                st.error(str(exc))
 
     probe_decision = st.session_state.listings_endpoint_decision
     scrape_allowed = probe_decision is not None and probe_decision.selected_endpoint is None
@@ -342,13 +350,15 @@ with tab_listings:
         clear_listings_inventory_cache()
         st.session_state.listings_inventory = {"records": [], "selected_endpoint": None}
         st.session_state.listings_endpoint_decision = None
+        st.session_state.listings_progress = {"last_completed_page": 0, "total_pages": 0, "total_posts": 0}
+        st.session_state.pop("resolved_base_url", None)
 
 
     listings_records = (st.session_state.listings_inventory or {}).get("records", [])
     if b5.download_button("Export Listings CSV", data=listings_to_csv(listings_records), file_name="listings_inventory.csv", mime="text/csv"):
         pass
 
-    progress = load_listings_progress()
+    progress = st.session_state.listings_progress if st.session_state.listings_progress else load_listings_progress()
     st.metric("Total Listings (unique)", len(listings_records))
     st.caption(
         f"Last page fetched: {progress.get('last_completed_page', 0)} | Total pages: {progress.get('total_pages', 0)} | Total posts: {progress.get('total_posts', 0)}"
