@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from copilot_patch import compute_score, generate_patch_plan, resolve_description_text
+from copilot_patch import compute_patch_eligibility, compute_score, generate_patch_plan, resolve_description_text
 from bd_copilot_client import validate_base_url_self_check, validate_form_payload_self_check
 from profiles import default_profile
 
@@ -167,3 +167,23 @@ def test_all_proposed_fields_blocked_sets_safe_to_apply_false():
     assert plan["safe_to_apply"] is False
     assert plan["eligible_fields"] == []
     assert {entry["field"] for entry in plan["blocked_fields"]} == {"group_desc", "post_tags"}
+
+
+def test_geo_fields_are_blocked_when_coordinates_are_missing_but_other_fields_can_apply():
+    schema_info = {
+        "allowed_fields": {"group_desc", "lat", "lon"},
+        "schema_mode": "snapshot",
+        "field_presence": {
+            "snapshot": {"group_desc", "lat", "lon"},
+            "user_get": set(),
+            "search": set(),
+        },
+    }
+    current = {"group_desc": "old", "lat": "", "lon": ""}
+    proposed = {"group_desc": "new", "lat": "39.63", "lon": "-106.37"}
+
+    eligibility = compute_patch_eligibility(current, proposed, schema_info, has_geo_coordinates=False)
+
+    assert eligibility["safe_to_apply"] is True
+    assert eligibility["eligible_fields"] == ["group_desc"]
+    assert {entry["field"] for entry in eligibility["blocked_fields"]} == {"lat", "lon"}
