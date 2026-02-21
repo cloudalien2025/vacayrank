@@ -13,6 +13,7 @@ from bd_copilot import evaluate_rules, load_bd_core
 from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
 import listings_inventory_engine as lie
+import listings_hydration_engine as lhe
 from inventory_engine import (
     InventoryBundle,
     build_canonical_member_set,
@@ -70,6 +71,10 @@ if "listings_inventory" not in st.session_state:
     st.session_state.listings_inventory = load_listings_inventory()
 if "listings_endpoint_decision" not in st.session_state:
     st.session_state.listings_endpoint_decision = None
+if "hydration_capability" not in st.session_state:
+    st.session_state.hydration_capability = None
+if "hydration_last_result" not in st.session_state:
+    st.session_state.hydration_last_result = None
 
 with st.sidebar:
     st.header("API Settings")
@@ -325,6 +330,7 @@ with tab_listings:
         st.session_state.listings_inventory = {"records": [], "selected_endpoint": None}
         st.session_state.listings_endpoint_decision = None
 
+
     listings_records = (st.session_state.listings_inventory or {}).get("records", [])
     if b5.download_button("Export Listings CSV", data=listings_to_csv(listings_records), file_name="listings_inventory.csv", mime="text/csv"):
         pass
@@ -361,6 +367,102 @@ with tab_listings:
         st.dataframe(pd.DataFrame(audit_rows))
     else:
         st.info("No listings evidence yet.")
+
+    st.markdown("---")
+    st.subheader("Hydrate Listings (API)")
+    hydration_rpm = st.slider("Hydration Requests/Minute", min_value=1, max_value=120, value=30, step=1)
+    hydration_max_per_run = st.number_input("Hydration max listings per run", min_value=1, max_value=500, value=25, step=1)
+    hydration_resume = st.toggle("Resume hydration from first incomplete listing", value=True)
+    h1, h2, h3, h4 = st.columns(4)
+    worklist = lhe.build_worklist(listings_records)
+
+    if h1.button("Probe GET-by-ID Capability"):
+        if not worklist:
+            st.warning("No listings inventory records found. Fetch Listings first.")
+        elif not api_key:
+            st.warning("API key required for capability probe.")
+        else:
+            probe_listing_id = worklist[0]
+            st.session_state.hydration_capability = lhe.probe_get_by_id_capability(client, probe_listing_id)
+
+    capability = st.session_state.hydration_capability or {}
+    get_available = bool(capability.get("available"))
+    endpoint_used = "GET /api/v2/users_portfolio_groups/get/{group_id}" if get_available else "POST /api/v2/users_portfolio_groups/search"
+
+    if h2.button("Hydrate Listings (API)"):
+        if not listings_records:
+            st.warning("No listings inventory records found.")
+        elif not api_key:
+            st.warning("API key required for hydration.")
+        else:
+            result = lhe.hydrate_listings(
+                client,
+                listings_records,
+                site_base=client.base_url,
+                rpm=int(hydration_rpm),
+                max_listings_per_run=int(hydration_max_per_run),
+                resume=bool(hydration_resume),
+                get_by_id_available=get_available,
+            )
+            st.session_state.hydration_last_result = {
+                "processed": result.processed_count,
+                "success": result.success_count,
+                "failures": result.failures_count,
+                "completed": result.completed_count,
+                "last_listing_id": result.last_listing_id,
+                "last_listing_name": result.last_listing_name,
+                "last_errors": result.last_errors,
+            }
+            st.success(f"Hydration run complete: success={result.success_count}, failures={result.failures_count}")
+
+    if h3.button("Clear Hydration Cache"):
+        lhe.clear_hydration_cache()
+        st.session_state.hydration_last_result = None
+
+    hydrated_records = lhe.load_hydrated_records()
+    features_rows = lhe.extract_features(hydrated_records)
+    jsonl_export = lhe.export_hydrated_jsonl_text()
+    csv_export = lhe.features_to_csv(features_rows)
+
+    h4.download_button("Export Hydrated JSONL", data=jsonl_export, file_name="listings_hydrated.jsonl", mime="application/json")
+    st.download_button("Export Features CSV", data=csv_export, file_name="listings_features.csv", mime="text/csv")
+
+    st.markdown("### Hydration Capability")
+    st.json(
+        {
+            "get_by_id_available": get_available,
+            "hydration_endpoint_used": endpoint_used,
+            "probe_result": capability,
+            "proof_note": "GET /api/v2/users_portfolio_groups/get/{id} must return HTTP 200 and matching group_id to be considered available.",
+        }
+    )
+
+    checkpoint = lhe.load_checkpoint()
+    progress_cols = st.columns(3)
+    progress_cols[0].metric("Hydrated completed / worklist", f"{checkpoint.get('completed_ids_count', 0)} / {len(worklist)}")
+    progress_cols[1].metric("Hydration failures (checkpoint)", int(checkpoint.get("failures_count", 0) or 0))
+    last_label = f"{checkpoint.get('last_completed_listing_id') or 'n/a'}"
+    progress_cols[2].metric("Last hydrated listing_id", last_label)
+    if st.session_state.hydration_last_result:
+        st.caption(
+            f"Last run: processed={st.session_state.hydration_last_result['processed']}, "
+            f"success={st.session_state.hydration_last_result['success']}, "
+            f"failures={st.session_state.hydration_last_result['failures']}"
+        )
+        if st.session_state.hydration_last_result.get("last_listing_id"):
+            st.write(
+                f"Last hydrated: {st.session_state.hydration_last_result.get('last_listing_id')} — "
+                f"{st.session_state.hydration_last_result.get('last_listing_name') or ''}"
+            )
+        for err in st.session_state.hydration_last_result.get("last_errors", [])[-3:]:
+            st.warning(err)
+
+    if hydrated_records:
+        st.markdown("### Hydrated Norm Preview")
+        norm_preview = [r.get("norm", {}) for r in hydrated_records[:20]]
+        st.dataframe(pd.DataFrame(norm_preview))
+        st.markdown("### Features Preview")
+        st.dataframe(pd.DataFrame(features_rows[:20]))
 
 with tab_copilot:
     st.subheader("BD Co-Pilot — Intelligence Schema v1")
