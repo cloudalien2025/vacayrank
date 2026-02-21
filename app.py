@@ -668,7 +668,8 @@ with tab_copilot:
             selected_record = listing_map.get(selected_label) if selected_label else None
             selected_norm = copy.deepcopy((selected_record or {}).get("norm") or {})
             if selected_norm:
-                selected_norm["raw_user"] = copy.deepcopy(selected_norm)
+                selected_norm["raw_user"] = copy.deepcopy((selected_record or {}).get("raw") or {})
+                selected_norm["listing_snapshot"] = copy.deepcopy((selected_record or {}).get("raw") or {})
                 selected_norm.setdefault("user_id", selected_norm.get("listing_id") or selected_norm.get("group_id"))
                 selected_norm.setdefault("listing_id", selected_norm.get("group_id") or selected_norm.get("user_id"))
 
