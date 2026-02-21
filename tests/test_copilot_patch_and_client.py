@@ -142,6 +142,7 @@ def test_missing_geo_is_advisory_when_only_desc_and_tags_are_proposed():
     assert plan["safe_to_apply"] is True
     assert sorted(plan["eligible_fields"]) == ["group_desc", "post_tags"]
     assert plan["blocked_fields"] == []
+    assert plan["blocking_reasons_by_field"] == {}
     assert any("Missing lat/lon" in note for note in plan["advisory_notes"])
 
 
@@ -166,7 +167,8 @@ def test_all_proposed_fields_blocked_sets_safe_to_apply_false():
 
     assert plan["safe_to_apply"] is False
     assert plan["eligible_fields"] == []
-    assert {entry["field"] for entry in plan["blocked_fields"]} == {"group_desc", "post_tags"}
+    assert set(plan["blocked_fields"]) == {"group_desc", "post_tags"}
+    assert set(plan["blocking_reasons_by_field"].keys()) == {"group_desc", "post_tags"}
 
 
 def test_geo_fields_are_blocked_when_coordinates_are_missing_but_other_fields_can_apply():
@@ -186,4 +188,61 @@ def test_geo_fields_are_blocked_when_coordinates_are_missing_but_other_fields_ca
 
     assert eligibility["safe_to_apply"] is True
     assert eligibility["eligible_fields"] == ["group_desc"]
-    assert {entry["field"] for entry in eligibility["blocked_fields"]} == {"lat", "lon"}
+    assert set(eligibility["blocked_fields"]) == {"lat", "lon"}
+    assert set(eligibility["blocking_reasons_by_field"].keys()) == {"lat", "lon"}
+
+
+def test_patch_plan_eligibility_is_exhaustive_and_never_null():
+    profile = default_profile()
+    listing = {
+        "listing_id": "vail-4",
+        "user_id": "vail-4",
+        "group_name": "Vail Film Festival",
+        "group_desc": "",
+        "post_tags": "",
+        "images_count": 0,
+        "lat": "",
+        "lon": "",
+        "group_status": "1",
+        "listing_snapshot": {"group_desc": ""},
+    }
+
+    score = compute_score(listing, profile)
+    plan = generate_patch_plan(listing, score, profile)
+
+    assert isinstance(plan["patch_plan"], dict)
+    assert isinstance(plan["eligible_fields"], list)
+    assert isinstance(plan["blocked_fields"], list)
+    assert isinstance(plan["blocking_reasons_by_field"], dict)
+    assert isinstance(plan["safe_to_apply"], bool)
+
+    all_fields = set(plan["patch_plan"].keys())
+    partition = set(plan["eligible_fields"]) | set(plan["blocked_fields"])
+    assert partition == all_fields
+    assert set(plan["eligible_fields"]).isdisjoint(set(plan["blocked_fields"]))
+    assert plan["safe_to_apply"] == (len(plan["eligible_fields"]) > 0)
+
+
+def test_empty_patch_plan_has_never_null_eligibility_shapes():
+    profile = default_profile()
+    listing = {
+        "listing_id": "vail-5",
+        "user_id": "vail-5",
+        "group_name": "Vail Film Festival",
+        "group_desc": " ".join(["festival"] * 140),
+        "post_tags": "film,festival,colorado",
+        "images_count": 6,
+        "lat": "39.6403",
+        "lon": "-106.3742",
+        "group_status": "1",
+        "listing_snapshot": {"group_desc": "ready", "post_tags": "film,festival,colorado"},
+    }
+
+    score = compute_score(listing, profile)
+    plan = generate_patch_plan(listing, score, profile)
+
+    assert plan["patch_plan"] == {}
+    assert plan["eligible_fields"] == []
+    assert plan["blocked_fields"] == []
+    assert plan["blocking_reasons_by_field"] == {}
+    assert plan["safe_to_apply"] is False
