@@ -119,3 +119,51 @@ def test_unknown_fields_still_blocked_with_schema_audit_reason():
     plan = generate_patch_plan(listing, score, profile, set_active_opt_in=True)
     assert "group_status" not in plan["proposed_changes"]
     assert any("group_status blocked:" in warning for warning in plan["validation_warnings"])
+
+
+def test_missing_geo_is_advisory_when_only_desc_and_tags_are_proposed():
+    profile = default_profile()
+    listing = {
+        "listing_id": "vail-1",
+        "user_id": "vail-1",
+        "group_name": "Vail Film Festival",
+        "group_desc": "",
+        "post_tags": "film",
+        "images_count": 2,
+        "lat": "",
+        "lon": "",
+        "group_status": "1",
+        "listing_snapshot": {"group_desc": "", "post_tags": "film"},
+    }
+
+    score = compute_score(listing, profile)
+    plan = generate_patch_plan(listing, score, profile)
+
+    assert plan["safe_to_apply"] is True
+    assert sorted(plan["eligible_fields"]) == ["group_desc", "post_tags"]
+    assert plan["blocked_fields"] == []
+    assert any("Missing lat/lon" in note for note in plan["advisory_notes"])
+
+
+def test_all_proposed_fields_blocked_sets_safe_to_apply_false():
+    profile = default_profile()
+    listing = {
+        "listing_id": "vail-3",
+        "user_id": "vail-3",
+        "group_name": "Vail Film Festival",
+        "group_desc": "",
+        "post_tags": "",
+        "images_count": 2,
+        "lat": "",
+        "lon": "",
+        "group_status": "1",
+        "listing_snapshot": {},
+        "search_obj": {"first_name": "Jane"},
+    }
+
+    score = compute_score(listing, profile)
+    plan = generate_patch_plan(listing, score, profile)
+
+    assert plan["safe_to_apply"] is False
+    assert plan["eligible_fields"] == []
+    assert {entry["field"] for entry in plan["blocked_fields"]} == {"group_desc", "post_tags"}

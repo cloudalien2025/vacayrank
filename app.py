@@ -773,8 +773,12 @@ with tab_copilot:
                 for field, proposed in plan.get("proposed_changes", {}).items():
                     current_value = listing_norm.get(field)
                     rationale = plan.get("rationales", {}).get(field, {})
-                    st.markdown(f"**{field}**")
+                    eligibility = plan.get("field_eligibility", {}).get(field, {"eligible": True, "reason": None})
+                    badge = "🟢 Will apply" if eligibility.get("eligible") else "🔴 Blocked"
+                    st.markdown(f"**{field}** · {badge}")
                     st.caption(f"Current: {str(current_value)[:140]}")
+                    if not eligibility.get("eligible") and eligibility.get("reason"):
+                        st.caption(f"Block reason: {eligibility.get('reason')}")
                     edited_value = st.text_area(
                         f"Proposed value · {field}",
                         value=str(proposed),
@@ -799,6 +803,8 @@ with tab_copilot:
                         "before_components": score_result.components,
                         "after_components": preview.components,
                         "safe_to_apply": plan.get("safe_to_apply"),
+                        "eligible_fields": plan.get("eligible_fields"),
+                        "blocked_fields": plan.get("blocked_fields"),
                         "validation_warnings": plan.get("validation_warnings"),
                         "advisory_notes": plan.get("advisory_notes"),
                     }
