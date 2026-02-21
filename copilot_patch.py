@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -68,11 +70,49 @@ def _component_tier(value: int, ok: int, good: int) -> float:
     return 0.0
 
 
+_DESCRIPTION_FIELDS: List[str] = [
+    "group_desc",
+    "group_description",
+    "post_desc",
+    "post_description",
+    "description",
+    "post_content",
+    "content",
+]
+
+
+def strip_html(s: str) -> str:
+    if not isinstance(s, str) or not s:
+        return ""
+    without_tags = re.sub(r"<[^>]+>", " ", s)
+    normalized_ws = re.sub(r"\s+", " ", without_tags)
+    return normalized_ws.strip()
+
+
+def _count_words(value: Any) -> int:
+    if not isinstance(value, str):
+        return 0
+    text = value.strip()
+    if not text:
+        return 0
+    return len([token for token in re.split(r"\s+", text) if token])
+
+
+def resolve_description_text(listing_obj: Dict[str, Any]) -> tuple[str, str]:
+    for field_name in _DESCRIPTION_FIELDS:
+        value = listing_obj.get(field_name)
+        if isinstance(value, str) and value.strip():
+            return value, field_name
+    return "", ""
+
+
 def compute_score(listing_norm: Dict[str, Any], profile: Dict[str, Any]) -> ScoreResult:
     params = profile["params"]
     weights = profile["weights"]
 
-    desc_words = _as_int(listing_norm.get("desc_word_count"))
+    desc_text_raw, desc_source_field = resolve_description_text(listing_norm)
+    desc_visible_text = strip_html(desc_text_raw)
+    desc_words = _count_words(desc_visible_text)
     image_count = _as_int(listing_norm.get("images_count") or listing_norm.get("image_count"))
     tags_value = _as_str(listing_norm.get("post_tags"))
     tags = [t.strip() for t in tags_value.split(",") if t.strip()] if tags_value else (listing_norm.get("tags_list") or [])
@@ -106,7 +146,14 @@ def compute_score(listing_norm: Dict[str, Any], profile: Dict[str, Any]) -> Scor
         total_score = total_score * float(params["inactive_penalty"])
 
     components = {
-        "description": {"score": description_score, "evidence": f"desc_word_count={desc_words}"},
+        "description": {
+            "score": description_score,
+            "evidence": (
+                f"desc_source_field={desc_source_field or 'none'} "
+                f"desc_word_count={desc_words} "
+                f"desc_raw_len={len(desc_text_raw)}"
+            ),
+        },
         "media": {"score": media_score, "evidence": f"image_count={image_count}"},
         "tags": {"score": tags_score, "evidence": f"tag_count={tag_count}"},
         "geo": {"score": geo_score, "evidence": f"lat={listing_norm.get('lat')} lon={listing_norm.get('lon')}"},
@@ -255,7 +302,8 @@ def generate_patch_plan(
         "search_fields": len(schema_info["field_presence"]["search"]),
     }
 
-    desc_words = _as_int(listing_norm.get("desc_word_count"))
+    desc_text_raw, _ = resolve_description_text(listing_norm)
+    desc_words = _count_words(strip_html(desc_text_raw))
     if desc_words < int(params["desc_ok_words"]):
         field = FIELD_MAPPING["description"]
         desc_validation = _validate_writable_field(field, schema_info)
@@ -322,7 +370,7 @@ def generate_patch_plan(
     if not _as_str(listing_norm.get("revision_timestamp")):
         plan["advisory_notes"].append("Freshness recommendation: review and update listing content manually")
 
-    simulated = dict(listing_norm)
+    simulated = copy.deepcopy(listing_norm)
     simulated.update(plan["proposed_changes"])
     after = compute_score(simulated, profile)
     plan["preview_before_after"] = {

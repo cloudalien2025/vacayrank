@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from copilot_patch import compute_score, generate_patch_plan
+from copilot_patch import compute_score, generate_patch_plan, resolve_description_text
 from bd_copilot_client import validate_base_url_self_check, validate_form_payload_self_check
 from profiles import default_profile
 
@@ -36,6 +36,45 @@ def test_copilot_plan_has_evidence_and_preview_delta():
     assert "group_status" in plan["proposed_changes"]
     assert "desc_word_count" in plan["rationales"]["group_desc"]["evidence"]
     assert plan["preview_before_after"]["after_total"] >= plan["preview_before_after"]["before_total"]
+
+
+def test_resolve_description_text_prefers_group_desc():
+    listing = {
+        "group_desc": "<p>Primary description</p>",
+        "group_description": "Backup description",
+        "description": "Generic description",
+    }
+
+    text, source = resolve_description_text(listing)
+
+    assert source == "group_desc"
+    assert text == "<p>Primary description</p>"
+
+
+def test_preview_after_uses_patched_group_desc_word_count():
+    profile = default_profile()
+    listing = {
+        "listing_id": "177",
+        "user_id": "177",
+        "group_name": "Peak Cabin",
+        "group_category": "Cabin",
+        "group_desc": "tiny",
+        "post_tags": "nature",
+        "images_count": 3,
+        "lat": "39.63",
+        "lon": "-106.37",
+        "group_status": "1",
+        "listing_snapshot": {"post_tags": "nature", "group_desc": "tiny"},
+    }
+
+    score = compute_score(listing, profile)
+    plan = generate_patch_plan(listing, score, profile)
+
+    after_description_evidence = plan["preview_before_after"]["after_components"]["description"]["evidence"]
+    assert "desc_source_field=group_desc" in after_description_evidence
+    assert "desc_word_count=" in after_description_evidence
+    assert after_description_evidence != score.components["description"]["evidence"]
+
 
 
 def test_copilot_self_checks():

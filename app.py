@@ -788,7 +788,7 @@ with tab_copilot:
 
                 plan["proposed_changes"] = updated_changes
                 st.markdown("### Preview score after patch")
-                simulated = dict(listing_norm)
+                simulated = copy.deepcopy(listing_norm)
                 simulated.update(updated_changes)
                 preview = compute_score(simulated, profile)
                 st.json(
