@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from datetime import datetime, timezone
@@ -9,8 +10,16 @@ from typing import List, Tuple
 import pandas as pd
 import streamlit as st
 
-from bd_copilot import evaluate_rules, load_bd_core
+from bd_copilot_client import (
+    bd_get_user,
+    bd_update_user,
+    build_audit_entry,
+    normalize_base_url as normalize_copilot_base_url,
+    validate_base_url_self_check,
+    validate_form_payload_self_check,
+)
 from bd_write_engine import SafeWriteEngine
+from copilot_patch import compute_score, generate_patch_plan, identify_weaknesses
 from identity_resolution_engine import resolve_identity
 import listings_inventory_engine as lie
 import listings_hydration_engine as lhe
@@ -52,7 +61,7 @@ probe_listings_endpoints = getattr(lie, "probe_listings_endpoints", _missing_eng
 run_serp_gap_analysis = getattr(sge, "run_serp_gap_analysis", _missing_engine_fn("serp_gap_engine", "run_serp_gap_analysis"))
 
 st.set_page_config(page_title="VacayRank BD-Native", layout="wide")
-st.title("VacayRank — BD-Native Milestones 1-3")
+st.title("VacayRank — BD-Native Milestones 1-4")
 
 if "inventory_bundle" not in st.session_state:
     st.session_state.inventory_bundle = None
@@ -82,6 +91,10 @@ if "hydration_last_result" not in st.session_state:
     st.session_state.hydration_last_result = None
 if "ranking_result" not in st.session_state:
     st.session_state.ranking_result = None
+if "copilot_patch_plans" not in st.session_state:
+    st.session_state.copilot_patch_plans = {}
+if "copilot_audit_log" not in st.session_state:
+    st.session_state.copilot_audit_log = []
 
 with st.sidebar:
     st.header("API Settings")
@@ -611,52 +624,208 @@ with tab_ranking:
 
 
 with tab_copilot:
-    st.subheader("BD Co-Pilot — Intelligence Schema v1")
-    try:
-        bd_core = load_bd_core()
-        st.caption(
-            f"Schema {bd_core['version'].get('schema_version')} · KB {bd_core['version'].get('kb_version')} · Updated {bd_core['version'].get('updated_at')}"
-        )
+    st.subheader("BD Co-Pilot (Milestone 4)")
+    hydrated_records = lhe.load_hydrated_records()
+    if not hydrated_records:
+        st.info("Hydrate listings first to use BD Co-Pilot.")
+    else:
+        profiles.ensure_profile_store()
+        all_profiles = profiles.list_profiles()
+        profile_ids = [p["profile_id"] for p in all_profiles]
+        active_profile_id = profiles.get_active_profile_id()
 
-        latest_evidence = st.session_state.api_evidence[-1] if st.session_state.api_evidence else {}
-        if latest_evidence:
-            findings = evaluate_rules(latest_evidence, bd_core["rules"], bd_core["playbooks"])
-            grouped = {"blocker": [], "warn": [], "info": []}
-            for finding in findings:
-                grouped.setdefault(finding.get("severity", "info"), []).append(finding)
-
-            for severity in ["blocker", "warn", "info"]:
-                items = grouped.get(severity, [])
-                if not items:
+        left_panel, main_panel = st.columns([1, 2])
+        with left_panel:
+            search_q = st.text_input("Search listing name/category", value="", key="copilot_search")
+            listing_options = []
+            listing_map = {}
+            for record in hydrated_records:
+                norm = record.get("norm") or {}
+                listing_id = str(norm.get("listing_id") or norm.get("group_id") or record.get("listing_id") or "")
+                group_name = str(norm.get("group_name") or "")
+                category = str(norm.get("group_category") or norm.get("category") or "")
+                label = f"{listing_id} · {group_name} · {category}"
+                if search_q.strip() and search_q.lower() not in label.lower():
                     continue
-                st.markdown(f"### {severity.upper()}")
-                for item in items:
-                    st.markdown(f"**{item['id']}** — {item['title']}")
-                    if item.get("recommended_actions"):
-                        st.write("Recommended actions:")
-                        for action in item["recommended_actions"]:
-                            st.markdown(f"- {action}")
-                    playbook = item.get("playbook") or {}
-                    if playbook.get("steps"):
-                        st.write(f"Playbook: {playbook.get('title', playbook.get('id', 'N/A'))}")
-                        for step in playbook["steps"]:
-                            st.markdown(f"  - {step}")
+                listing_options.append(label)
+                listing_map[label] = record
 
-            debug_bundle = {
-                "evidence": latest_evidence,
-                "findings": findings,
-                "versions": bd_core["version"],
-            }
-            st.download_button(
-                "Export Debug Bundle",
-                data=json.dumps(debug_bundle, indent=2),
-                file_name="bd_copilot_debug_bundle.json",
-                mime="application/json",
+            selected_label = st.selectbox("Listing", options=listing_options, key="copilot_listing") if listing_options else None
+            selected_profile_id = st.selectbox(
+                "Score Profile",
+                options=profile_ids,
+                index=profile_ids.index(active_profile_id) if active_profile_id in profile_ids else 0,
+                key="copilot_profile",
             )
-        else:
-            st.info("No API evidence yet. Run Single Page Test or Inventory Fetch first.")
-    except Exception as exc:
-        st.error(f"Unable to load BD Co-Pilot files: {exc}")
+            selected_profile = profiles.load_profile(selected_profile_id)
+            selected_profile_hash = profiles.compute_profile_hash(selected_profile)
+            copilot_dry_run = st.toggle("Dry Run", value=True, key="copilot_dry_run")
+            set_active_opt_in = st.checkbox("Set Active (group_status=1)", value=False, key="copilot_set_active")
+            irreversible_ack = st.checkbox("Writes are irreversible", value=False, key="copilot_irreversible_ack")
+            typed_live_confirm = st.text_input("Typed Confirm (UPDATE)", value="", key="copilot_typed_confirm")
+            generate_clicked = st.button("Generate Patch Plan", key="copilot_generate")
+
+            selected_record = listing_map.get(selected_label) if selected_label else None
+            selected_norm = copy.deepcopy((selected_record or {}).get("norm") or {})
+            if selected_norm:
+                selected_norm["raw_user"] = copy.deepcopy(selected_norm)
+                selected_norm.setdefault("user_id", selected_norm.get("listing_id") or selected_norm.get("group_id"))
+                selected_norm.setdefault("listing_id", selected_norm.get("group_id") or selected_norm.get("user_id"))
+
+            plan_key = None
+            if selected_norm:
+                plan_key = f"{selected_norm.get('listing_id')}::{selected_profile_hash}"
+
+            if generate_clicked and selected_norm:
+                score_result = compute_score(selected_norm, selected_profile)
+                plan = generate_patch_plan(selected_norm, score_result, selected_profile, set_active_opt_in=set_active_opt_in)
+                st.session_state.copilot_patch_plans[plan_key] = {
+                    "plan": plan,
+                    "listing_norm": selected_norm,
+                    "score_result": score_result,
+                    "profile": selected_profile,
+                }
+
+            current_bundle = st.session_state.copilot_patch_plans.get(plan_key) if plan_key else None
+            can_apply = bool(
+                current_bundle
+                and not copilot_dry_run
+                and irreversible_ack
+                and typed_live_confirm.strip() == "UPDATE"
+                and current_bundle["plan"].get("safe_to_apply")
+                and current_bundle["plan"].get("proposed_changes")
+            )
+            apply_clicked = st.button("Apply Patch to BD", key="copilot_apply", disabled=not can_apply)
+
+            if apply_clicked and current_bundle:
+                listing_norm = current_bundle["listing_norm"]
+                plan = current_bundle["plan"]
+                user_id = plan.get("target_user_id")
+                if not api_key:
+                    st.error("API key required for live update")
+                else:
+                    try:
+                        normalized = normalize_copilot_base_url(base_url)
+                        update_response = bd_update_user(
+                            base_url=normalized,
+                            api_key=api_key,
+                            user_id=user_id,
+                            changes_dict=plan["proposed_changes"],
+                        )
+                        verify_response = bd_get_user(normalized, api_key, user_id)
+                        audit_entry = build_audit_entry(
+                            str(listing_norm.get("listing_id")),
+                            str(user_id),
+                            request_fields={"user_id": user_id, **plan["proposed_changes"]},
+                            response={
+                                "ok": update_response.get("ok"),
+                                "status_code": update_response.get("status_code"),
+                                "json": {
+                                    "update": update_response.get("json"),
+                                    "verify": verify_response.get("json"),
+                                },
+                            },
+                        )
+                        st.session_state.copilot_audit_log.append(audit_entry)
+                        if update_response.get("ok"):
+                            st.success(f"BD update success (HTTP {update_response.get('status_code')})")
+                        else:
+                            st.error(f"BD update failed (HTTP {update_response.get('status_code')}): {update_response.get('text')}")
+                    except Exception as exc:
+                        failure_entry = build_audit_entry(
+                            str(listing_norm.get("listing_id")),
+                            str(user_id),
+                            request_fields={"user_id": user_id, **plan["proposed_changes"]},
+                            response={"ok": False, "status_code": 0, "json": {"error": str(exc)}},
+                        )
+                        st.session_state.copilot_audit_log.append(failure_entry)
+                        st.error(str(exc))
+
+        with main_panel:
+            current_bundle = st.session_state.copilot_patch_plans.get(plan_key) if plan_key else None
+            if not current_bundle:
+                st.info("Select a listing and click Generate Patch Plan.")
+            else:
+                listing_norm = current_bundle["listing_norm"]
+                score_result = current_bundle["score_result"]
+                plan = current_bundle["plan"]
+                profile = current_bundle["profile"]
+
+                st.markdown("### Listing Snapshot")
+                st.json(
+                    {
+                        "listing_id": listing_norm.get("listing_id"),
+                        "user_id": listing_norm.get("user_id"),
+                        "group_name": listing_norm.get("group_name"),
+                        "group_category": listing_norm.get("group_category") or listing_norm.get("category"),
+                        "current_total_score": score_result.total_score,
+                        "component_breakdown": score_result.components,
+                    }
+                )
+
+                st.markdown("### Weaknesses (weighted impact)")
+                weakness_rows = identify_weaknesses(score_result, profile)
+                st.dataframe(pd.DataFrame(weakness_rows))
+
+                st.markdown("### Proposed Fixes")
+                updated_changes = {}
+                for field, proposed in plan.get("proposed_changes", {}).items():
+                    current_value = listing_norm.get(field)
+                    rationale = plan.get("rationales", {}).get(field, {})
+                    st.markdown(f"**{field}**")
+                    st.caption(f"Current: {str(current_value)[:140]}")
+                    edited_value = st.text_area(
+                        f"Proposed value · {field}",
+                        value=str(proposed),
+                        key=f"copilot_edit_{plan_key}_{field}",
+                        height=120,
+                    )
+                    updated_changes[field] = edited_value
+                    st.write(
+                        f"Rationale: {rationale.get('why', '')} | Evidence: {rationale.get('evidence', '')} | Expected lift: {rationale.get('expected_component_lift', '')}"
+                    )
+
+                plan["proposed_changes"] = updated_changes
+                st.markdown("### Preview score after patch")
+                simulated = dict(listing_norm)
+                simulated.update(updated_changes)
+                preview = compute_score(simulated, profile)
+                st.json(
+                    {
+                        "before_total": score_result.total_score,
+                        "after_total": preview.total_score,
+                        "delta": round(preview.total_score - score_result.total_score, 3),
+                        "before_components": score_result.components,
+                        "after_components": preview.components,
+                        "safe_to_apply": plan.get("safe_to_apply"),
+                        "validation_warnings": plan.get("validation_warnings"),
+                        "advisory_notes": plan.get("advisory_notes"),
+                    }
+                )
+
+                st.markdown("### Audit log (last 20 actions)")
+                audit_rows = st.session_state.copilot_audit_log[-20:]
+                if audit_rows:
+                    st.dataframe(pd.DataFrame(audit_rows))
+                    st.download_button(
+                        "Export Co-Pilot Audit JSON",
+                        data=json.dumps(audit_rows, indent=2),
+                        file_name="bd_copilot_audit.json",
+                        mime="application/json",
+                    )
+                else:
+                    st.caption("No write attempts yet.")
+
+                st.markdown("### Self-checks")
+                url_check_ok, url_check_msg = validate_base_url_self_check()
+                payload_check_ok, payload_check_msg = validate_form_payload_self_check()
+                st.write(
+                    {
+                        "validate_base_url": {"ok": url_check_ok, "detail": url_check_msg},
+                        "validate_form_payload": {"ok": payload_check_ok, "detail": payload_check_msg},
+                    }
+                )
+
 
 with tab_audit:
     st.subheader("Milestone 2.5 — BD Structural Audit")
