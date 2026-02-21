@@ -770,10 +770,11 @@ with tab_copilot:
 
                 st.markdown("### Proposed Fixes")
                 updated_changes = {}
-                for field, proposed in plan.get("proposed_changes", {}).items():
+                proposed_fixes = plan.get("proposed_fixes") or plan.get("proposed_changes", {})
+                for field, proposed in proposed_fixes.items():
                     current_value = listing_norm.get(field)
                     rationale = plan.get("rationales", {}).get(field, {})
-                    eligibility = plan.get("field_eligibility", {}).get(field, {"eligible": True, "reason": None})
+                    eligibility = plan.get("field_eligibility", {}).get(field, {"eligible": False, "reason": "Eligibility missing from backend"})
                     badge = "🟢 Will apply" if eligibility.get("eligible") else "🔴 Blocked"
                     st.markdown(f"**{field}** · {badge}")
                     st.caption(f"Current: {str(current_value)[:140]}")
@@ -785,7 +786,8 @@ with tab_copilot:
                         key=f"copilot_edit_{plan_key}_{field}",
                         height=120,
                     )
-                    updated_changes[field] = edited_value
+                    if eligibility.get("eligible"):
+                        updated_changes[field] = edited_value
                     st.write(
                         f"Rationale: {rationale.get('why', '')} | Evidence: {rationale.get('evidence', '')} | Expected lift: {rationale.get('expected_component_lift', '')}"
                     )

@@ -285,6 +285,57 @@ def _validate_writable_field(field: str, schema_info: Dict[str, Any]) -> Dict[st
     }
 
 
+def _has_material_change(current_value: Any, proposed_value: Any) -> bool:
+    current_text = _as_str(current_value)
+    proposed_text = _as_str(proposed_value)
+    if not proposed_text:
+        return False
+    return current_text != proposed_text
+
+
+def compute_patch_eligibility(
+    current_obj: Dict[str, Any],
+    proposed_fixes: Dict[str, Any],
+    schema_info: Dict[str, Any],
+    *,
+    has_geo_coordinates: bool,
+) -> Dict[str, Any]:
+    field_eligibility: Dict[str, Dict[str, Any]] = {}
+    blocked_fields: List[Dict[str, str]] = []
+    eligible_fields: List[str] = []
+    apply_changes: Dict[str, Any] = {}
+
+    for field, proposed_value in proposed_fixes.items():
+        schema_validation = _validate_writable_field(field, schema_info)
+        reason: Optional[str] = None
+        if not schema_validation["allowed"]:
+            reason = (
+                f"schema={schema_validation['schema_mode']} snapshot={schema_validation['in_snapshot']} "
+                f"user_get={schema_validation['in_user_get']} search={schema_validation['in_search']} reason={schema_validation['reason']}"
+            )
+        elif field in GEO_RELATED_FIELDS and not has_geo_coordinates:
+            reason = "Missing coordinates source"
+        elif not _has_material_change(current_obj.get(field), proposed_value):
+            reason = "No material non-empty change from current value"
+
+        if reason:
+            blocked_fields.append({"field": field, "reason": reason})
+            field_eligibility[field] = {"eligible": False, "reason": reason}
+            continue
+
+        eligible_fields.append(field)
+        apply_changes[field] = proposed_value
+        field_eligibility[field] = {"eligible": True, "reason": None}
+
+    return {
+        "field_eligibility": field_eligibility,
+        "eligible_fields": eligible_fields,
+        "blocked_fields": blocked_fields,
+        "safe_to_apply": bool(eligible_fields),
+        "proposed_changes": apply_changes,
+    }
+
+
 def generate_patch_plan(
     listing_norm: Dict[str, Any],
     score_result: ScoreResult,
@@ -297,6 +348,7 @@ def generate_patch_plan(
         "profile_id": score_result.profile_id,
         "profile_hash": score_result.profile_hash,
         "proposed_changes": {},
+        "proposed_fixes": {},
         "rationales": {},
         "validation_warnings": [],
         "preview_before_after": {"before_total": score_result.total_score, "after_total": score_result.total_score},
@@ -320,49 +372,29 @@ def generate_patch_plan(
         "search_fields": len(schema_info["field_presence"]["search"]),
     }
 
-    def _record_blocked_field(field_name: str, reason: str) -> None:
-        plan["blocked_fields"].append({"field": field_name, "reason": reason})
-        plan["validation_warnings"].append(f"{field_name} blocked: {reason}")
-
     desc_text_raw, _ = resolve_description_text(listing_norm)
     desc_words = _count_words(strip_html(desc_text_raw))
     if desc_words < int(params["desc_ok_words"]):
         field = FIELD_MAPPING["description"]
-        desc_validation = _validate_writable_field(field, schema_info)
-        if desc_validation["allowed"]:
-            proposed = _description_template(listing_norm)
-            plan["proposed_changes"][field] = proposed
-            plan["rationales"][field] = {
-                "why": "Description below threshold",
-                "evidence": f"desc_word_count={desc_words} < desc_ok_words={params['desc_ok_words']}",
-                "expected_component_lift": "description up to 0.6 or 1.0",
-            }
-        else:
-            reason = (
-                f"schema={desc_validation['schema_mode']} snapshot={desc_validation['in_snapshot']} "
-                f"user_get={desc_validation['in_user_get']} search={desc_validation['in_search']} reason={desc_validation['reason']}"
-            )
-            _record_blocked_field(field, reason)
+        proposed = _description_template(listing_norm)
+        plan["proposed_fixes"][field] = proposed
+        plan["rationales"][field] = {
+            "why": "Description below threshold",
+            "evidence": f"desc_word_count={desc_words} < desc_ok_words={params['desc_ok_words']}",
+            "expected_component_lift": "description up to 0.6 or 1.0",
+        }
 
     tags_value = _as_str(listing_norm.get("post_tags"))
     tags = [t.strip() for t in tags_value.split(",") if t.strip()] if tags_value else (listing_norm.get("tags_list") or [])
     if len(tags) < 3:
         field = FIELD_MAPPING["tags"]
-        tags_validation = _validate_writable_field(field, schema_info)
-        if tags_validation["allowed"]:
-            proposed_tags = _tag_template(listing_norm)
-            plan["proposed_changes"][field] = proposed_tags
-            plan["rationales"][field] = {
-                "why": "Insufficient tags",
-                "evidence": f"tag_count={len(tags)} < 3",
-                "expected_component_lift": "tags up to 0.6 or 1.0",
-            }
-        else:
-            reason = (
-                f"schema={tags_validation['schema_mode']} snapshot={tags_validation['in_snapshot']} "
-                f"user_get={tags_validation['in_user_get']} search={tags_validation['in_search']} reason={tags_validation['reason']}"
-            )
-            _record_blocked_field(field, reason)
+        proposed_tags = _tag_template(listing_norm)
+        plan["proposed_fixes"][field] = proposed_tags
+        plan["rationales"][field] = {
+            "why": "Insufficient tags",
+            "evidence": f"tag_count={len(tags)} < 3",
+            "expected_component_lift": "tags up to 0.6 or 1.0",
+        }
 
     image_count = _as_int(listing_norm.get("images_count") or listing_norm.get("image_count"))
     if image_count < 5:
@@ -372,52 +404,40 @@ def generate_patch_plan(
 
     if _as_str(listing_norm.get("group_status")) != "1":
         status_field = FIELD_MAPPING["status"]
-        status_validation = _validate_writable_field(status_field, schema_info)
-        if set_active_opt_in and status_validation["allowed"]:
-            plan["proposed_changes"][status_field] = "1"
+        if set_active_opt_in:
+            plan["proposed_fixes"][status_field] = "1"
             plan["rationales"][status_field] = {
                 "why": "Listing is inactive",
                 "evidence": f"group_status={listing_norm.get('group_status')}",
                 "expected_component_lift": "status to 1.0 and removes inactive penalty",
             }
-        elif set_active_opt_in and not status_validation["allowed"]:
-            reason = (
-                f"schema={status_validation['schema_mode']} snapshot={status_validation['in_snapshot']} "
-                f"user_get={status_validation['in_user_get']} search={status_validation['in_search']} reason={status_validation['reason']}"
-            )
-            _record_blocked_field(status_field, reason)
         else:
             plan["advisory_notes"].append("Status is inactive; enable 'Set Active' option to propose activation")
 
     if not _as_str(listing_norm.get("revision_timestamp")):
         plan["advisory_notes"].append("Freshness recommendation: review and update listing content manually")
 
+    geo_targets = [field for field in plan["proposed_fixes"] if field in GEO_RELATED_FIELDS]
     if not has_geo:
-        geo_targets = [field for field in plan["proposed_changes"] if field in GEO_RELATED_FIELDS]
         if geo_targets:
             plan["validation_warnings"].append("Missing lat/lon; geo writeback blocked until coordinates are available")
-            for field in geo_targets:
-                _record_blocked_field(field, "Missing coordinates source")
         else:
             plan["advisory_notes"].append("Missing lat/lon; geo writeback blocked until coordinates are available")
 
-    blocked_by_field = {entry["field"]: entry["reason"] for entry in plan["blocked_fields"]}
-    allowed_changes: Dict[str, Any] = {}
-    for field, value in plan["proposed_changes"].items():
-        blocked_reason = blocked_by_field.get(field)
-        if blocked_reason:
-            plan["field_eligibility"][field] = {"eligible": False, "reason": blocked_reason}
-            plan["rationales"].pop(field, None)
-        else:
-            plan["field_eligibility"][field] = {"eligible": True, "reason": None}
-            plan["eligible_fields"].append(field)
-            allowed_changes[field] = value
-
+    eligibility = compute_patch_eligibility(
+        listing_norm,
+        plan["proposed_fixes"],
+        schema_info,
+        has_geo_coordinates=has_geo,
+    )
+    plan["field_eligibility"] = eligibility["field_eligibility"]
+    plan["eligible_fields"] = eligibility["eligible_fields"]
+    plan["blocked_fields"] = eligibility["blocked_fields"]
+    plan["safe_to_apply"] = eligibility["safe_to_apply"]
+    plan["proposed_changes"] = eligibility["proposed_changes"]
     for blocked in plan["blocked_fields"]:
-        plan["field_eligibility"].setdefault(blocked["field"], {"eligible": False, "reason": blocked["reason"]})
-
-    plan["proposed_changes"] = allowed_changes
-    plan["safe_to_apply"] = bool(plan["eligible_fields"])
+        plan["validation_warnings"].append(f"{blocked['field']} blocked: {blocked['reason']}")
+        plan["rationales"].pop(blocked["field"], None)
 
     simulated = copy.deepcopy(listing_norm)
     simulated.update(plan["proposed_changes"])
