@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from profiles import compute_profile_hash
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -301,8 +305,9 @@ def compute_patch_eligibility(
     has_geo_coordinates: bool,
 ) -> Dict[str, Any]:
     field_eligibility: Dict[str, Dict[str, Any]] = {}
-    blocked_fields: List[Dict[str, str]] = []
+    blocked_fields: List[str] = []
     eligible_fields: List[str] = []
+    blocking_reasons_by_field: Dict[str, str] = {}
     apply_changes: Dict[str, Any] = {}
 
     for field, proposed_value in proposed_fixes.items():
@@ -319,7 +324,8 @@ def compute_patch_eligibility(
             reason = "No material non-empty change from current value"
 
         if reason:
-            blocked_fields.append({"field": field, "reason": reason})
+            blocked_fields.append(field)
+            blocking_reasons_by_field[field] = reason
             field_eligibility[field] = {"eligible": False, "reason": reason}
             continue
 
@@ -329,8 +335,9 @@ def compute_patch_eligibility(
 
     return {
         "field_eligibility": field_eligibility,
-        "eligible_fields": eligible_fields,
-        "blocked_fields": blocked_fields,
+        "eligible_fields": eligible_fields or [],
+        "blocked_fields": blocked_fields or [],
+        "blocking_reasons_by_field": blocking_reasons_by_field or {},
         "safe_to_apply": bool(eligible_fields),
         "proposed_changes": apply_changes,
     }
@@ -349,6 +356,7 @@ def generate_patch_plan(
         "profile_hash": score_result.profile_hash,
         "proposed_changes": {},
         "proposed_fixes": {},
+        "patch_plan": {},
         "rationales": {},
         "validation_warnings": [],
         "preview_before_after": {"before_total": score_result.total_score, "after_total": score_result.total_score},
@@ -356,6 +364,7 @@ def generate_patch_plan(
         "advisory_notes": [],
         "eligible_fields": [],
         "blocked_fields": [],
+        "blocking_reasons_by_field": {},
         "field_eligibility": {},
     }
 
@@ -424,20 +433,35 @@ def generate_patch_plan(
         else:
             plan["advisory_notes"].append("Missing lat/lon; geo writeback blocked until coordinates are available")
 
+    plan["patch_plan"] = dict(plan["proposed_fixes"])
+
     eligibility = compute_patch_eligibility(
         listing_norm,
-        plan["proposed_fixes"],
+        plan["patch_plan"],
         schema_info,
         has_geo_coordinates=has_geo,
     )
     plan["field_eligibility"] = eligibility["field_eligibility"]
-    plan["eligible_fields"] = eligibility["eligible_fields"]
-    plan["blocked_fields"] = eligibility["blocked_fields"]
-    plan["safe_to_apply"] = eligibility["safe_to_apply"]
+    plan["eligible_fields"] = eligibility["eligible_fields"] or []
+    plan["blocked_fields"] = eligibility["blocked_fields"] or []
+    plan["blocking_reasons_by_field"] = eligibility["blocking_reasons_by_field"] or {}
+    plan["safe_to_apply"] = len(plan["eligible_fields"]) > 0
     plan["proposed_changes"] = eligibility["proposed_changes"]
-    for blocked in plan["blocked_fields"]:
-        plan["validation_warnings"].append(f"{blocked['field']} blocked: {blocked['reason']}")
-        plan["rationales"].pop(blocked["field"], None)
+    for blocked_field in plan["blocked_fields"]:
+        reason = plan["blocking_reasons_by_field"].get(blocked_field, "Field not in writable schema union")
+        plan["validation_warnings"].append(f"{blocked_field} blocked: {reason}")
+        plan["rationales"].pop(blocked_field, None)
+
+    logger.debug(
+        "Patch plan eligibility computed",
+        extra={
+            "patch_plan_fields": list(plan["patch_plan"].keys()),
+            "eligible_fields": plan["eligible_fields"],
+            "blocked_fields": plan["blocked_fields"],
+            "blocking_reasons_by_field": plan["blocking_reasons_by_field"],
+            "safe_to_apply": plan["safe_to_apply"],
+        },
+    )
 
     simulated = copy.deepcopy(listing_norm)
     simulated.update(plan["proposed_changes"])

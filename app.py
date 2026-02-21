@@ -770,23 +770,34 @@ with tab_copilot:
 
                 st.markdown("### Proposed Fixes")
                 updated_changes = {}
-                proposed_fixes = plan.get("proposed_fixes") or plan.get("proposed_changes", {})
+                proposed_fixes = plan.get("patch_plan") or plan.get("proposed_fixes") or plan.get("proposed_changes", {})
+                eligible_fields = set(plan.get("eligible_fields") or [])
+                blocked_fields = set(plan.get("blocked_fields") or [])
+                blocking_reasons = plan.get("blocking_reasons_by_field") or {}
                 for field, proposed in proposed_fixes.items():
                     current_value = listing_norm.get(field)
                     rationale = plan.get("rationales", {}).get(field, {})
-                    eligibility = plan.get("field_eligibility", {}).get(field, {"eligible": False, "reason": "Eligibility missing from backend"})
-                    badge = "🟢 Will apply" if eligibility.get("eligible") else "🔴 Blocked"
+                    if field in eligible_fields:
+                        eligible = True
+                        reason = None
+                    elif field in blocked_fields:
+                        eligible = False
+                        reason = blocking_reasons.get(field, "Field not in writable schema union")
+                    else:
+                        eligible = False
+                        reason = "Eligibility missing from backend"
+                    badge = "🟢 Will apply" if eligible else "🔴 Blocked"
                     st.markdown(f"**{field}** · {badge}")
                     st.caption(f"Current: {str(current_value)[:140]}")
-                    if not eligibility.get("eligible") and eligibility.get("reason"):
-                        st.caption(f"Block reason: {eligibility.get('reason')}")
+                    if not eligible and reason:
+                        st.caption(f"Block reason: {reason}")
                     edited_value = st.text_area(
                         f"Proposed value · {field}",
                         value=str(proposed),
                         key=f"copilot_edit_{plan_key}_{field}",
                         height=120,
                     )
-                    if eligibility.get("eligible"):
+                    if eligible:
                         updated_changes[field] = edited_value
                     st.write(
                         f"Rationale: {rationale.get('why', '')} | Evidence: {rationale.get('evidence', '')} | Expected lift: {rationale.get('expected_component_lift', '')}"
@@ -804,9 +815,11 @@ with tab_copilot:
                         "delta": round(preview.total_score - score_result.total_score, 3),
                         "before_components": score_result.components,
                         "after_components": preview.components,
-                        "safe_to_apply": plan.get("safe_to_apply"),
-                        "eligible_fields": plan.get("eligible_fields"),
-                        "blocked_fields": plan.get("blocked_fields"),
+                        "patch_plan": plan.get("patch_plan") or {},
+                        "safe_to_apply": bool(plan.get("safe_to_apply")),
+                        "eligible_fields": plan.get("eligible_fields") or [],
+                        "blocked_fields": plan.get("blocked_fields") or [],
+                        "blocking_reasons_by_field": plan.get("blocking_reasons_by_field") or {},
                         "validation_warnings": plan.get("validation_warnings"),
                         "advisory_notes": plan.get("advisory_notes"),
                     }
