@@ -27,6 +27,21 @@ FIELD_MAPPING: Dict[str, str] = {
     "address": "post_location",
 }
 
+GEO_RELATED_FIELDS: Set[str] = {
+    "lat",
+    "lon",
+    "post_location",
+    "location",
+    "address",
+    "address1",
+    "address2",
+    "city",
+    "state",
+    "zip",
+    "postal_code",
+    "country",
+}
+
 
 def _as_str(value: Any) -> str:
     return "" if value is None else str(value).strip()
@@ -285,8 +300,11 @@ def generate_patch_plan(
         "rationales": {},
         "validation_warnings": [],
         "preview_before_after": {"before_total": score_result.total_score, "after_total": score_result.total_score},
-        "safe_to_apply": True,
+        "safe_to_apply": False,
         "advisory_notes": [],
+        "eligible_fields": [],
+        "blocked_fields": [],
+        "field_eligibility": {},
     }
 
     params = profile["params"]
@@ -302,6 +320,10 @@ def generate_patch_plan(
         "search_fields": len(schema_info["field_presence"]["search"]),
     }
 
+    def _record_blocked_field(field_name: str, reason: str) -> None:
+        plan["blocked_fields"].append({"field": field_name, "reason": reason})
+        plan["validation_warnings"].append(f"{field_name} blocked: {reason}")
+
     desc_text_raw, _ = resolve_description_text(listing_norm)
     desc_words = _count_words(strip_html(desc_text_raw))
     if desc_words < int(params["desc_ok_words"]):
@@ -316,10 +338,11 @@ def generate_patch_plan(
                 "expected_component_lift": "description up to 0.6 or 1.0",
             }
         else:
-            plan["validation_warnings"].append(
-                f"{field} blocked: schema={desc_validation['schema_mode']} snapshot={desc_validation['in_snapshot']} "
+            reason = (
+                f"schema={desc_validation['schema_mode']} snapshot={desc_validation['in_snapshot']} "
                 f"user_get={desc_validation['in_user_get']} search={desc_validation['in_search']} reason={desc_validation['reason']}"
             )
+            _record_blocked_field(field, reason)
 
     tags_value = _as_str(listing_norm.get("post_tags"))
     tags = [t.strip() for t in tags_value.split(",") if t.strip()] if tags_value else (listing_norm.get("tags_list") or [])
@@ -335,40 +358,66 @@ def generate_patch_plan(
                 "expected_component_lift": "tags up to 0.6 or 1.0",
             }
         else:
-            plan["validation_warnings"].append(
-                f"post_tags blocked: schema={tags_validation['schema_mode']} snapshot={tags_validation['in_snapshot']} "
+            reason = (
+                f"schema={tags_validation['schema_mode']} snapshot={tags_validation['in_snapshot']} "
                 f"user_get={tags_validation['in_user_get']} search={tags_validation['in_search']} reason={tags_validation['reason']}"
             )
+            _record_blocked_field(field, reason)
 
     image_count = _as_int(listing_norm.get("images_count") or listing_norm.get("image_count"))
     if image_count < 5:
         plan["advisory_notes"].append("Media TODO: add at least 5 images (no upload/write in Milestone 4)")
 
     has_geo = _safe_float(listing_norm.get("lat")) is not None and _safe_float(listing_norm.get("lon")) is not None
-    if not has_geo:
-        plan["safe_to_apply"] = False
-        plan["validation_warnings"].append("Missing lat/lon; geo writeback blocked until coordinates are available")
 
     if _as_str(listing_norm.get("group_status")) != "1":
         status_field = FIELD_MAPPING["status"]
         status_validation = _validate_writable_field(status_field, schema_info)
         if set_active_opt_in and status_validation["allowed"]:
-            plan["proposed_changes"][FIELD_MAPPING["status"]] = "1"
-            plan["rationales"][FIELD_MAPPING["status"]] = {
+            plan["proposed_changes"][status_field] = "1"
+            plan["rationales"][status_field] = {
                 "why": "Listing is inactive",
                 "evidence": f"group_status={listing_norm.get('group_status')}",
                 "expected_component_lift": "status to 1.0 and removes inactive penalty",
             }
         elif set_active_opt_in and not status_validation["allowed"]:
-            plan["validation_warnings"].append(
-                f"{status_field} blocked: schema={status_validation['schema_mode']} snapshot={status_validation['in_snapshot']} "
+            reason = (
+                f"schema={status_validation['schema_mode']} snapshot={status_validation['in_snapshot']} "
                 f"user_get={status_validation['in_user_get']} search={status_validation['in_search']} reason={status_validation['reason']}"
             )
+            _record_blocked_field(status_field, reason)
         else:
             plan["advisory_notes"].append("Status is inactive; enable 'Set Active' option to propose activation")
 
     if not _as_str(listing_norm.get("revision_timestamp")):
         plan["advisory_notes"].append("Freshness recommendation: review and update listing content manually")
+
+    if not has_geo:
+        geo_targets = [field for field in plan["proposed_changes"] if field in GEO_RELATED_FIELDS]
+        if geo_targets:
+            plan["validation_warnings"].append("Missing lat/lon; geo writeback blocked until coordinates are available")
+            for field in geo_targets:
+                _record_blocked_field(field, "Missing coordinates source")
+        else:
+            plan["advisory_notes"].append("Missing lat/lon; geo writeback blocked until coordinates are available")
+
+    blocked_by_field = {entry["field"]: entry["reason"] for entry in plan["blocked_fields"]}
+    allowed_changes: Dict[str, Any] = {}
+    for field, value in plan["proposed_changes"].items():
+        blocked_reason = blocked_by_field.get(field)
+        if blocked_reason:
+            plan["field_eligibility"][field] = {"eligible": False, "reason": blocked_reason}
+            plan["rationales"].pop(field, None)
+        else:
+            plan["field_eligibility"][field] = {"eligible": True, "reason": None}
+            plan["eligible_fields"].append(field)
+            allowed_changes[field] = value
+
+    for blocked in plan["blocked_fields"]:
+        plan["field_eligibility"].setdefault(blocked["field"], {"eligible": False, "reason": blocked["reason"]})
+
+    plan["proposed_changes"] = allowed_changes
+    plan["safe_to_apply"] = bool(plan["eligible_fields"])
 
     simulated = copy.deepcopy(listing_norm)
     simulated.update(plan["proposed_changes"])
