@@ -14,6 +14,8 @@ from bd_write_engine import SafeWriteEngine
 from identity_resolution_engine import resolve_identity
 import listings_inventory_engine as lie
 import listings_hydration_engine as lhe
+import profiles
+import ranking_engine
 from inventory_engine import (
     InventoryBundle,
     build_canonical_member_set,
@@ -75,6 +77,8 @@ if "hydration_capability" not in st.session_state:
     st.session_state.hydration_capability = None
 if "hydration_last_result" not in st.session_state:
     st.session_state.hydration_last_result = None
+if "ranking_result" not in st.session_state:
+    st.session_state.ranking_result = None
 
 with st.sidebar:
     st.header("API Settings")
@@ -122,8 +126,17 @@ def append_run_audit(action: str, records_fetched: int, pages_fetched: int, outc
     )
 
 
-tab_inventory, tab_listings, tab_copilot, tab_audit, tab_serp, tab_write, tab_log = st.tabs(
-    ["Inventory (API Index)", "Listings Inventory (Discovery)", "BD Co-Pilot", "Structural Audit", "SERP Gap Analysis", "Write Queue", "Audit Log"]
+tab_inventory, tab_listings, tab_ranking, tab_copilot, tab_audit, tab_serp, tab_write, tab_log = st.tabs(
+    [
+        "Inventory (API Index)",
+        "Listings Inventory (Discovery)",
+        "Ranking (Milestone 3)",
+        "BD Co-Pilot",
+        "Structural Audit",
+        "SERP Gap Analysis",
+        "Write Queue",
+        "Audit Log",
+    ]
 )
 
 with tab_inventory:
@@ -463,6 +476,129 @@ with tab_listings:
         st.dataframe(pd.DataFrame(norm_preview))
         st.markdown("### Features Preview")
         st.dataframe(pd.DataFrame(features_rows[:20]))
+
+
+with tab_ranking:
+    st.subheader("Ranking (Milestone 3)")
+    profiles.ensure_profile_store()
+    hydrated_path = Path("data/listings_hydrated.jsonl")
+    if not hydrated_path.exists():
+        st.info("Run Milestone 2 hydration first.")
+    else:
+        st.markdown("### Profile Manager")
+        all_profiles = profiles.list_profiles()
+        profile_ids = [p["profile_id"] for p in all_profiles]
+        active_profile_id = profiles.get_active_profile_id()
+        selected_profile_id = st.selectbox(
+            "Select profile",
+            options=profile_ids,
+            index=profile_ids.index(active_profile_id) if active_profile_id in profile_ids else 0,
+            key="ranking_selected_profile",
+        )
+        selected_profile = profiles.load_profile(selected_profile_id)
+        selected_hash = profiles.compute_profile_hash(selected_profile)
+        st.caption(f"Profile hash: `{selected_hash}` | Updated: {selected_profile.get('updated_at')}")
+
+        with st.expander("Create / Edit Profile", expanded=False):
+            new_profile_id = st.text_input("Profile ID", value=selected_profile["profile_id"], key="ranking_profile_id")
+            new_profile_name = st.text_input("Profile Name", value=selected_profile["profile_name"], key="ranking_profile_name")
+            st.markdown("**Weights (must total 1.0)**")
+            weight_values = {}
+            for key in profiles.REQUIRED_WEIGHTS:
+                weight_values[key] = st.number_input(
+                    f"weight_{key}",
+                    min_value=0.0,
+                    max_value=1.0,
+                    step=0.01,
+                    value=float(selected_profile["weights"][key]),
+                    key=f"weight_{key}",
+                )
+            st.write(f"Weight sum: {sum(weight_values.values()):.6f}")
+            st.markdown("**Parameters**")
+            params = {}
+            for key in profiles.REQUIRED_PARAMS:
+                if key == "inactive_penalty":
+                    params[key] = st.number_input(
+                        key,
+                        min_value=0.0,
+                        max_value=1.0,
+                        step=0.01,
+                        value=float(selected_profile["params"][key]),
+                        key=f"param_{key}",
+                    )
+                else:
+                    params[key] = st.number_input(
+                        key,
+                        min_value=0,
+                        step=1,
+                        value=int(selected_profile["params"][key]),
+                        key=f"param_{key}",
+                    )
+
+            csave, cactive = st.columns(2)
+            if csave.button("Save Profile"):
+                now = datetime.now(timezone.utc).isoformat()
+                draft = {
+                    "profile_id": new_profile_id.strip(),
+                    "profile_name": new_profile_name.strip() or new_profile_id.strip(),
+                    "created_at": selected_profile.get("created_at") or now,
+                    "updated_at": now,
+                    "schema_version": 1,
+                    "weights": weight_values,
+                    "params": params,
+                }
+                try:
+                    profiles.save_profile(draft)
+                    st.success(f"Saved profile {draft['profile_id']}")
+                except Exception as exc:
+                    st.error(f"Profile save failed: {exc}")
+            if cactive.button("Set Active"):
+                profiles.set_active_profile(selected_profile_id)
+                st.success(f"Active profile set to {selected_profile_id}")
+
+        st.markdown("### Ranking Runner")
+        if st.button("Run Ranking"):
+            try:
+                run = ranking_engine.run_ranking(selected_profile, hydrated_path=hydrated_path)
+                st.session_state.ranking_result = run
+                st.success(f"Ranking run complete: {run['run_id']}")
+            except Exception as exc:
+                st.error(f"Ranking failed: {exc}")
+
+        run = st.session_state.ranking_result
+        if run and run.get("rows"):
+            rows_df = pd.DataFrame(run["rows"])
+            st.markdown("### Ranked Table")
+            categories = sorted(set(rows_df["group_category"].fillna("Uncategorized")))
+            category = st.selectbox("Category filter", options=["All"] + categories, key="rank_category")
+            query = st.text_input("Search by listing name", value="", key="rank_search")
+            filtered = rows_df.copy()
+            if category != "All":
+                filtered = filtered[filtered["group_category"] == category]
+            if query.strip():
+                filtered = filtered[filtered["group_name"].str.contains(query.strip(), case=False, na=False)]
+            top_n = st.number_input("Top N", min_value=1, max_value=max(1, len(filtered)), value=min(20, len(filtered)), step=1)
+            st.dataframe(filtered.head(int(top_n)))
+
+            st.markdown("### Listing Explainer")
+            listing_options = [str(x) for x in rows_df["listing_id"].tolist()]
+            selected_listing = st.selectbox("Select listing_id", options=listing_options, key="rank_listing")
+            selected_row = next((r for r in run["rows"] if str(r.get("listing_id")) == selected_listing), None)
+            if selected_row:
+                st.json(selected_row.get("explanation", {}))
+
+            st.markdown("### Exports")
+            meta = run.get("meta", {})
+            csv_path = Path(meta.get("csv_path", ""))
+            json_path = Path(meta.get("json_path", ""))
+            profile_path = profiles.profile_path(selected_profile_id)
+            if csv_path.exists():
+                st.download_button("Download Ranked CSV", data=csv_path.read_text(encoding="utf-8"), file_name=csv_path.name, mime="text/csv")
+            if json_path.exists():
+                st.download_button("Download Ranked JSON", data=json_path.read_text(encoding="utf-8"), file_name=json_path.name, mime="application/json")
+            if profile_path.exists():
+                st.download_button("Download Profile JSON", data=profile_path.read_text(encoding="utf-8"), file_name=profile_path.name, mime="application/json")
+
 
 with tab_copilot:
     st.subheader("BD Co-Pilot — Intelligence Schema v1")
