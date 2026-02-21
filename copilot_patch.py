@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from profiles import compute_profile_hash
 
@@ -169,6 +169,60 @@ def _tag_template(listing: Dict[str, Any]) -> str:
     return ", ".join(unique[:6])
 
 
+def _extract_dict(candidate: Any) -> Dict[str, Any]:
+    return candidate if isinstance(candidate, dict) else {}
+
+
+def get_writable_schema_for_listing(
+    listing_snapshot: Optional[Dict[str, Any]],
+    user_get_obj: Optional[Dict[str, Any]] = None,
+    search_obj: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    snapshot = _extract_dict(listing_snapshot)
+    user_get = _extract_dict(user_get_obj)
+    search = _extract_dict(search_obj)
+
+    snapshot_fields = set(snapshot.keys())
+    user_get_fields = set(user_get.keys())
+    search_fields = set(search.keys())
+    allowed_fields: Set[str] = set().union(snapshot_fields, user_get_fields, search_fields)
+
+    if user_get_fields or search_fields:
+        schema_mode = "union(snapshot+user_get+search)"
+    else:
+        schema_mode = "snapshot"
+
+    return {
+        "allowed_fields": allowed_fields,
+        "schema_mode": schema_mode,
+        "field_presence": {
+            "snapshot": snapshot_fields,
+            "user_get": user_get_fields,
+            "search": search_fields,
+        },
+    }
+
+
+def _validate_writable_field(field: str, schema_info: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_fields = schema_info.get("allowed_fields") or set()
+    field_presence = schema_info.get("field_presence") or {}
+    in_snapshot = field in (field_presence.get("snapshot") or set())
+    in_user_get = field in (field_presence.get("user_get") or set())
+    in_search = field in (field_presence.get("search") or set())
+    allowed = field in allowed_fields
+
+    reason = "field present in schema set" if allowed else "field absent from writable schema set"
+    return {
+        "allowed": allowed,
+        "field": field,
+        "schema_mode": schema_info.get("schema_mode"),
+        "in_snapshot": in_snapshot,
+        "in_user_get": in_user_get,
+        "in_search": in_search,
+        "reason": reason,
+    }
+
+
 def generate_patch_plan(
     listing_norm: Dict[str, Any],
     score_result: ScoreResult,
@@ -189,12 +243,23 @@ def generate_patch_plan(
     }
 
     params = profile["params"]
-    existing_keys = set((listing_norm.get("raw_user") or {}).keys())
+    schema_info = get_writable_schema_for_listing(
+        _extract_dict(listing_norm.get("listing_snapshot") or listing_norm.get("raw_user")),
+        _extract_dict(listing_norm.get("user_get_obj")),
+        _extract_dict(listing_norm.get("search_obj")),
+    )
+    plan["schema_validation"] = {
+        "schema_mode": schema_info["schema_mode"],
+        "snapshot_fields": len(schema_info["field_presence"]["snapshot"]),
+        "user_get_fields": len(schema_info["field_presence"]["user_get"]),
+        "search_fields": len(schema_info["field_presence"]["search"]),
+    }
 
     desc_words = _as_int(listing_norm.get("desc_word_count"))
     if desc_words < int(params["desc_ok_words"]):
         field = FIELD_MAPPING["description"]
-        if field in existing_keys:
+        desc_validation = _validate_writable_field(field, schema_info)
+        if desc_validation["allowed"]:
             proposed = _description_template(listing_norm)
             plan["proposed_changes"][field] = proposed
             plan["rationales"][field] = {
@@ -202,12 +267,18 @@ def generate_patch_plan(
                 "evidence": f"desc_word_count={desc_words} < desc_ok_words={params['desc_ok_words']}",
                 "expected_component_lift": "description up to 0.6 or 1.0",
             }
+        else:
+            plan["validation_warnings"].append(
+                f"{field} blocked: schema={desc_validation['schema_mode']} snapshot={desc_validation['in_snapshot']} "
+                f"user_get={desc_validation['in_user_get']} search={desc_validation['in_search']} reason={desc_validation['reason']}"
+            )
 
     tags_value = _as_str(listing_norm.get("post_tags"))
     tags = [t.strip() for t in tags_value.split(",") if t.strip()] if tags_value else (listing_norm.get("tags_list") or [])
     if len(tags) < 3:
         field = FIELD_MAPPING["tags"]
-        if field in existing_keys:
+        tags_validation = _validate_writable_field(field, schema_info)
+        if tags_validation["allowed"]:
             proposed_tags = _tag_template(listing_norm)
             plan["proposed_changes"][field] = proposed_tags
             plan["rationales"][field] = {
@@ -216,7 +287,10 @@ def generate_patch_plan(
                 "expected_component_lift": "tags up to 0.6 or 1.0",
             }
         else:
-            plan["validation_warnings"].append("post_tags not present on user object; cannot safely write tags")
+            plan["validation_warnings"].append(
+                f"post_tags blocked: schema={tags_validation['schema_mode']} snapshot={tags_validation['in_snapshot']} "
+                f"user_get={tags_validation['in_user_get']} search={tags_validation['in_search']} reason={tags_validation['reason']}"
+            )
 
     image_count = _as_int(listing_norm.get("images_count") or listing_norm.get("image_count"))
     if image_count < 5:
@@ -228,13 +302,20 @@ def generate_patch_plan(
         plan["validation_warnings"].append("Missing lat/lon; geo writeback blocked until coordinates are available")
 
     if _as_str(listing_norm.get("group_status")) != "1":
-        if set_active_opt_in and FIELD_MAPPING["status"] in existing_keys:
+        status_field = FIELD_MAPPING["status"]
+        status_validation = _validate_writable_field(status_field, schema_info)
+        if set_active_opt_in and status_validation["allowed"]:
             plan["proposed_changes"][FIELD_MAPPING["status"]] = "1"
             plan["rationales"][FIELD_MAPPING["status"]] = {
                 "why": "Listing is inactive",
                 "evidence": f"group_status={listing_norm.get('group_status')}",
                 "expected_component_lift": "status to 1.0 and removes inactive penalty",
             }
+        elif set_active_opt_in and not status_validation["allowed"]:
+            plan["validation_warnings"].append(
+                f"{status_field} blocked: schema={status_validation['schema_mode']} snapshot={status_validation['in_snapshot']} "
+                f"user_get={status_validation['in_user_get']} search={status_validation['in_search']} reason={status_validation['reason']}"
+            )
         else:
             plan["advisory_notes"].append("Status is inactive; enable 'Set Active' option to propose activation")
 

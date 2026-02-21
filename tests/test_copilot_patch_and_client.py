@@ -41,3 +41,42 @@ def test_copilot_plan_has_evidence_and_preview_delta():
 def test_copilot_self_checks():
     assert validate_base_url_self_check()[0] is True
     assert validate_form_payload_self_check()[0] is True
+
+
+def test_post_tags_allowed_from_listing_snapshot_schema():
+    profile = default_profile()
+    listing = {
+        "listing_id": "88",
+        "user_id": "88",
+        "desc_word_count": 1,
+        "post_tags": "",
+        "images_count": 0,
+        "lat": "40.0",
+        "lon": "-105.0",
+        "group_status": "1",
+        "listing_snapshot": {"post_tags": "", "group_desc": ""},
+        "search_obj": {"first_name": "Jane", "email": "jane@example.com"},
+    }
+    score = compute_score(listing, profile)
+    plan = generate_patch_plan(listing, score, profile)
+    assert "post_tags" in plan["proposed_changes"]
+    assert plan["schema_validation"]["schema_mode"].startswith("union")
+
+
+def test_unknown_fields_still_blocked_with_schema_audit_reason():
+    profile = default_profile()
+    listing = {
+        "listing_id": "99",
+        "user_id": "99",
+        "desc_word_count": 1,
+        "post_tags": "",
+        "images_count": 0,
+        "lat": "40.0",
+        "lon": "-105.0",
+        "group_status": "0",
+        "listing_snapshot": {"post_tags": "", "group_desc": ""},
+    }
+    score = compute_score(listing, profile)
+    plan = generate_patch_plan(listing, score, profile, set_active_opt_in=True)
+    assert "group_status" not in plan["proposed_changes"]
+    assert any("group_status blocked:" in warning for warning in plan["validation_warnings"])
