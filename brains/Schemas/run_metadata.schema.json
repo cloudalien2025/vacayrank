@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://brains.local/schemas/run_metadata.schema.json",
+  "title": "Run Metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "keyword", "started_at", "ended_at", "config", "errors", "env"],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "keyword": { "type": "string", "minLength": 1 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "ended_at": { "type": "string", "format": "date-time" },
+    "config": { "type": "object" },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number", "boolean", "null"] }
+    }
+  }
+}
