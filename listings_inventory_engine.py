@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
 import requests
@@ -25,6 +25,43 @@ LISTINGS_SEARCH_ENDPOINT = "/api/v2/users_portfolio_groups/search"
 LISTINGS_GET_ENDPOINT = "/api/v2/users_portfolio_groups/get/{group_id}"
 
 VALID_HINT_KEYS = {"group_id", "group_filename", "group_name", "post_location"}
+
+
+def normalize_endpoint(endpoint: Any) -> Optional[str]:
+    value = str(endpoint or "").strip()
+    if not value or value.lower() in {"none", "null"}:
+        return None
+    if "://" in value:
+        raise ValueError(f"Endpoint must be a path, not a full URL: {value!r}")
+    if not value.startswith("/"):
+        value = f"/{value}"
+    return value
+
+
+def build_safe_api_url(base_url: str, endpoint: Any) -> str:
+    normalized_endpoint = normalize_endpoint(endpoint)
+    if normalized_endpoint is None:
+        raise ValueError(f"Invalid listings endpoint: {endpoint!r}")
+    final_url = urljoin(base_url.rstrip("/") + "/", normalized_endpoint.lstrip("/"))
+    parsed = urlparse(final_url)
+    netloc = (parsed.netloc or "").strip()
+    if not netloc or "none" in netloc.lower():
+        raise ValueError(
+            f"Unsafe listings URL generated: base_url={base_url!r}, endpoint={endpoint!r}, normalized_endpoint={normalized_endpoint!r}, final_url={final_url!r}, netloc={netloc!r}"
+        )
+    return final_url
+
+def request_url_context(base_url: str, endpoint: Any) -> Dict[str, str]:
+    final_url = build_safe_api_url(base_url, endpoint)
+    parsed = urlparse(final_url)
+    return {
+        "base_url": base_url,
+        "endpoint": str(endpoint),
+        "endpoint_normalized": normalize_endpoint(endpoint) or "",
+        "final_url": final_url,
+        "parsed_netloc": parsed.netloc,
+    }
+
 
 
 @dataclass
@@ -63,7 +100,9 @@ def _request_json(
         payload = (fixtures or {}).get(key, {"status": "error", "message": "dry_run fixture missing"})
         return 200, payload, json.dumps(payload)
 
-    url = f"{client.base_url}{path}"
+    url = build_safe_api_url(client.base_url, path)
+    parsed_url = urlparse(url)
+    normalized_path = normalize_endpoint(path)
     headers = {"X-Api-Key": client.api_key}
     if method.upper() == "POST":
         headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -80,6 +119,11 @@ def _request_json(
             "label": label,
             "method": method.upper(),
             "url": url,
+            "base_url": client.base_url,
+            "endpoint": path,
+            "endpoint_normalized": normalized_path,
+            "final_url": url,
+            "parsed_netloc": parsed_url.netloc,
             "status_code": response.status_code,
             "request_body_keys": sorted((data or {}).keys()),
             "response_text_snippet": (response.text or "")[:500],
@@ -205,7 +249,7 @@ def probe_listings_endpoints(client: BDClient, dry_run: bool = False, fixtures: 
     records = _extract_records(payload)
     has_expected_type = any(str(r.get("data_id", "")).strip() == str(LISTINGS_DATA_ID) and str(r.get("data_type", "")).strip() == "4" for r in records)
     details["data_categories_get"] = {"http_status": status, "status": payload.get("status"), "records": len(records), "matched": has_expected_type}
-    _audit_append({"timestamp": datetime.now(timezone.utc).isoformat(), "action": "probe", "endpoint": f"/api/v2/data_categories/get/{LISTINGS_DATA_ID}", "method": "GET", "params": {}, "outcome": "success" if has_expected_type else "fail", "http_status": status, "response_text": text[:300], "counts_returned": {"records": len(records)}})
+    _audit_append({"timestamp": datetime.now(timezone.utc).isoformat(), "action": "probe", "endpoint": f"/api/v2/data_categories/get/{LISTINGS_DATA_ID}", "method": "GET", "params": {}, "outcome": "success" if has_expected_type else "fail", "http_status": status, "response_text": text[:300], "counts_returned": {"records": len(records)}, **request_url_context(client.base_url, f"/api/v2/data_categories/get/{LISTINGS_DATA_ID}")})
     if status != 200 or not has_expected_type:
         rejected.append(f"GET /api/v2/data_categories/get/{LISTINGS_DATA_ID} failed (http={status}, status={payload.get('status')})")
         return EndpointDecision(selected_endpoint=None, accepted_reason="", rejected_reasons=rejected, probe_details=details)
@@ -232,9 +276,9 @@ def probe_listings_endpoints(client: BDClient, dry_run: bool = False, fixtures: 
         "has_group_id": parsed["has_group_id"],
         "has_totals": parsed["has_totals"],
     }
-    _audit_append({"timestamp": datetime.now(timezone.utc).isoformat(), "action": "probe", "endpoint": LISTINGS_SEARCH_ENDPOINT, "method": "POST", "params": form, "outcome": "success" if probe_ok else "fail", "http_status": status, "response_text": text[:300], "counts_returned": {"records": len(parsed["records"]), "total_pages": parsed["total_pages"], "total_posts": parsed["total_posts"]}})
+    _audit_append({"timestamp": datetime.now(timezone.utc).isoformat(), "action": "probe", "endpoint": LISTINGS_SEARCH_ENDPOINT, "method": "POST", "params": form, "outcome": "success" if probe_ok else "fail", "http_status": status, "response_text": text[:300], "counts_returned": {"records": len(parsed["records"]), "total_pages": parsed["total_pages"], "total_posts": parsed["total_posts"]}, **request_url_context(client.base_url, LISTINGS_SEARCH_ENDPOINT)})
     if probe_ok and parsed["records"]:
-        return EndpointDecision(selected_endpoint=LISTINGS_SEARCH_ENDPOINT, accepted_reason="Listings API usable via users_portfolio_groups/search", rejected_reasons=rejected, probe_details=details)
+        return EndpointDecision(selected_endpoint=normalize_endpoint(LISTINGS_SEARCH_ENDPOINT), accepted_reason="Listings API usable via users_portfolio_groups/search", rejected_reasons=rejected, probe_details=details)
 
     rejected.append(f"POST {LISTINGS_SEARCH_ENDPOINT} failed (http={status}, status={payload.get('status')}, records={len(parsed['records'])}, total_posts={parsed['total_posts']})")
     secondary_form = build_listings_search_payload(limit=1, page=1)
@@ -250,7 +294,7 @@ def probe_listings_endpoints(client: BDClient, dry_run: bool = False, fixtures: 
     )
     secondary_records = _extract_records(payload2)
     details["data_posts_search"] = {"http_status": status2, "status": payload2.get("status"), "records": len(secondary_records)}
-    _audit_append({"timestamp": datetime.now(timezone.utc).isoformat(), "action": "probe", "endpoint": "/api/v2/data_posts/search", "method": "POST", "params": secondary_form, "outcome": "fail" if status2 != 200 else "success", "http_status": status2, "response_text": text2[:300], "counts_returned": {"records": len(secondary_records)}})
+    _audit_append({"timestamp": datetime.now(timezone.utc).isoformat(), "action": "probe", "endpoint": "/api/v2/data_posts/search", "method": "POST", "params": secondary_form, "outcome": "fail" if status2 != 200 else "success", "http_status": status2, "response_text": text2[:300], "counts_returned": {"records": len(secondary_records)}, **request_url_context(client.base_url, "/api/v2/data_posts/search")})
     rejected.append(f"POST /api/v2/data_posts/search secondary check http={status2}, records={len(secondary_records)}")
     return EndpointDecision(selected_endpoint=None, accepted_reason="", rejected_reasons=rejected, probe_details=details)
 
@@ -268,7 +312,9 @@ def fetch_listings_via_api(
     fixtures: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> ListingsInventoryResult:
     method = "POST"
-    path = endpoint
+    path = normalize_endpoint(endpoint)
+    if path is None:
+        raise ValueError("Run 'Probe API for Listings Endpoints' first.")
     session = requests.Session()
     limiter = RateLimiter(rpm)
     seen: Dict[str, Dict[str, Any]] = {canonical_listing_key(r): r for r in (existing_records or [])}
@@ -308,6 +354,7 @@ def fetch_listings_via_api(
                 "response_text": text[:300],
                 "outcome": "success" if status == 200 and parsed["ok"] else "fail",
                 "counts_returned": {"records": len(records), "page": page, "total_pages": total_pages, "total_posts": total_posts},
+                **request_url_context(client.base_url, path),
             }
         )
         if status != 200 or not parsed["ok"]:
@@ -326,13 +373,13 @@ def fetch_listings_via_api(
             break
 
     result = list(seen.values())
-    persist_listings_inventory(result, selected_endpoint=endpoint)
+    persist_listings_inventory(result, selected_endpoint=path)
     return ListingsInventoryResult(
         records=result,
         source="api",
         by_category=_count_by(result, "category"),
         by_geo=_count_by(result, "geo"),
-        endpoint_decision=EndpointDecision(selected_endpoint=endpoint, accepted_reason="locked endpoint fetch", rejected_reasons=[], probe_details={}),
+        endpoint_decision=EndpointDecision(selected_endpoint=path, accepted_reason="locked endpoint fetch", rejected_reasons=[], probe_details={}),
         last_completed_page=last_completed_page,
         total_pages=total_pages,
         total_posts=total_posts,
@@ -493,7 +540,7 @@ def _count_by(records: List[Dict[str, Any]], key: str) -> Dict[str, int]:
 
 def persist_listings_inventory(records: List[Dict[str, Any]], selected_endpoint: Optional[str]) -> None:
     LISTINGS_INVENTORY_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    LISTINGS_INVENTORY_CACHE.write_text(json.dumps({"records": records, "selected_endpoint": selected_endpoint}, indent=2), encoding="utf-8")
+    LISTINGS_INVENTORY_CACHE.write_text(json.dumps({"records": records, "selected_endpoint": normalize_endpoint(selected_endpoint)}, indent=2), encoding="utf-8")
     if not LISTINGS_PROGRESS_CACHE.exists():
         LISTINGS_PROGRESS_CACHE.write_text(json.dumps({"count": len(records), "timestamp": time.time(), "last_completed_page": 0, "total_pages": 0, "total_posts": 0}, indent=2), encoding="utf-8")
 
@@ -502,7 +549,9 @@ def load_listings_inventory() -> Dict[str, Any]:
     if not LISTINGS_INVENTORY_CACHE.exists():
         return {"records": [], "selected_endpoint": None}
     try:
-        return json.loads(LISTINGS_INVENTORY_CACHE.read_text(encoding="utf-8"))
+        payload = json.loads(LISTINGS_INVENTORY_CACHE.read_text(encoding="utf-8"))
+        payload["selected_endpoint"] = normalize_endpoint(payload.get("selected_endpoint"))
+        return payload
     except Exception:
         return {"records": [], "selected_endpoint": None}
 

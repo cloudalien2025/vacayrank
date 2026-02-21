@@ -6,9 +6,11 @@ from listings_inventory_engine import (
     LISTINGS_AUDIT_CACHE,
     LISTINGS_SEARCH_ENDPOINT,
     build_listings_search_payload,
+    build_safe_api_url,
     canonical_listing_key,
     detect_repetition,
     parse_users_portfolio_groups_response,
+    normalize_endpoint,
     probe_listings_endpoints,
 )
 
@@ -52,6 +54,31 @@ class ListingsInventoryEngineTests(unittest.TestCase):
         self.assertIn("Listings Inventory (Discovery)", app_src)
         self.assertIn("Probe API for Listings Endpoints", app_src)
         self.assertIn("Build Listings (Scrape Fallback)", app_src)
+
+
+    def test_endpoint_normalization_and_safe_url_builder(self):
+        self.assertIsNone(normalize_endpoint(None))
+        self.assertIsNone(normalize_endpoint(" none "))
+        self.assertEqual(normalize_endpoint("api/v2/users_portfolio_groups/search"), "/api/v2/users_portfolio_groups/search")
+        with self.assertRaises(ValueError):
+            normalize_endpoint("https://evil.example/path")
+
+        final_url = build_safe_api_url("https://www.vailvacay.com", "/api/v2/users_portfolio_groups/search")
+        self.assertEqual(final_url, "https://www.vailvacay.com/api/v2/users_portfolio_groups/search")
+
+        with self.assertRaises(ValueError):
+            build_safe_api_url("https://www.vailvacay.com", None)
+        with self.assertRaises(ValueError):
+            build_safe_api_url("https://www.vailvacay.comnone", "/api/v2/users_portfolio_groups/search")
+
+    def test_stress_sequence_clear_then_fetch_is_blocked(self):
+        endpoint = normalize_endpoint(LISTINGS_SEARCH_ENDPOINT)
+        self.assertEqual(endpoint, LISTINGS_SEARCH_ENDPOINT)
+
+        cleared_endpoint = normalize_endpoint(None)
+        self.assertIsNone(cleared_endpoint)
+        with self.assertRaises(ValueError):
+            build_safe_api_url("https://www.vailvacay.com", cleared_endpoint)
 
     def test_listings_request_builder_and_parser(self):
         payload = build_listings_search_payload(limit=10, page=2)

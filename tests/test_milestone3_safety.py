@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from milestone3.audit_log import AuditLog
-from milestone3.bd_client import BDClient
+from milestone3.bd_client import BDClient, normalize_base_url
 from milestone3.patch_engine import compute_patch
 from milestone3.write_queue import build_write_queue_from_m2, enforce_max_writes_per_session
 
@@ -38,6 +38,11 @@ class Milestone3SafetyTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["Content-Type"], "application/x-www-form-urlencoded")
         self.assertIn("data", kwargs)
         self.assertNotIn("json", kwargs)
+
+    def test_normalize_base_url(self):
+        self.assertEqual(normalize_base_url("www.vailvacay.com"), "https://www.vailvacay.com")
+        self.assertEqual(normalize_base_url(" https://www.vailvacay.com/ "), "https://www.vailvacay.com")
+        self.assertEqual(normalize_base_url("https://www.vailvacay.com/listings"), "https://www.vailvacay.com/listings")
 
     def test_patch_only_updates(self):
         current = {"company": "Old", "city": "A", "website": "w"}
